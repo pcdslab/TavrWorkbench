@@ -10,9 +10,7 @@ from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
 import ctk
 import qt
-from datetime import datetime
 import SegmentStatistics
-import logging
 import json
 
 # Suppress VTK warnings globally to prevent console flooding and UI freezing

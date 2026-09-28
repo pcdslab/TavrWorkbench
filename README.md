@@ -3,86 +3,93 @@
 <p align="center">
   <img src="TavrWorkbench.png" alt="TavrWorkbench Icon Dark", width=200>
 </p>
+TavrWorkbench is a 3D Slicer extension for fast and structured review of TAVR CT segmentations and measurements. It lets a reviewer step through a dataset case by case, inspect the CT volume together with its segmentation and anatomical markups, rate the quality of each result, correct the mask when needed, and export everything to a clean annotation file.
 
-<!-- ![TavrWorkbench Icon](TavrWorkbench.png) -->
+![TavrWorkbench main panel](/TavrWorkbench/Screenshots/main_panel.png)
 
-A 3D Slicer extension for reviewing TAVR (transcatheter aortic valve replacement) CT segmentations and measurements, rate quality case by case, leave comments, and track progress across a dataset.
+## Use Case
 
-## What it does
+Automated TAVR pipelines produce segmentations of the aorta, aortic root, left ventricle, coronaries and thoracic aorta, along with measurements such as annulus, sinus of Valsalva (SOV) and sinotubular junction (STJ) contours, diameters, hinge points, heights and centerlines. Before these outputs can be trusted for research or planning, an expert has to check them. TavrWorkbench turns that check into a quick and repeatable workflow, where each case receives an overall rating, a rating for every segmentation label and measurement, and an optional comment. Cases that need small fixes can be edited right inside the same module.
 
-- Loads CT volumes with their segmentations (Aorta, Aortic Root, Left Ventricle, Coronaries, Thoracic Aorta) one case at a time.
-- Lets you rate each case **overall**, per **segmentation label**, and per **measurement** (✓ Acceptable / △ Minor correction / ✕ Not acceptable), plus a free-text comment.
-- Tracks review progress (Total / Reviewed / Pending) and saves everything to disk as you go, so you can stop and resume later.
-- Aligns the 2D slice views to a loaded contour (annulus, SOV, STJ), or slides a cross-section along a centerline curve.
-- Includes a built-in Segment Editor and Markups panel for correcting segmentations directly.
+![Review workflow](/TavrWorkbench/Screenshots/review_workflow.png)
 
-## Requirements
 
-- 3D Slicer (with the **Segmentations** and **Markups** modules, and the **SegmentStatistics** module).
-- Python packages `pandas`, `numpy`, `SimpleITK`, installed automatically on first run if missing.
+## Installation
 
-## Installing
+1. Open 3D Slicer and go to the Extensions Manager.
+2. Search for TavrWorkbench and click Install.
+3. Restart 3D Slicer and open the module from the module selector.
 
-1. Open Slicer → **Developer Tools → Extension Wizard**.
-2. Click **Select Extension** and point it at the `TavrWorkbench` folder.
-3. The `TavrWorkbench` module will appear in the module dropdown.
+The module installs pandas, numpy and SimpleITK automatically on first launch if they are missing.
 
-## Input data
+## Inputs
 
-You can load a dataset in one of two ways:
+The Input panel offers two ways to load a dataset. Choose one using the Directory or JSON Manifest option.
 
-**Directory mode** : pick a folder containing:
-- `*.nii` / `*.nii.gz` / `*.nrrd` volumes, optionally paired with masks named `<volume>_mask.nii.gz`
-- or a `mapping.csv` / `mapping_unique.csv` with `img_path`, `mask_path` (and `subj_id` for the "unique" variant)
+### Directory Mode
 
-### Recommended:
-**JSON manifest mode** : pick a `.json` file shaped like this (top-level metadata is optional/informational; only `samples` is read):
+Select a folder that contains your volumes in .nii, .nii.gz or .nrrd format. The module finds the cases in one of three ways.
+
+1. Automatic pairing: each volume is matched with a mask that shares its name and ends with _mask, for example case01.nii.gz and case01_mask.nii.gz.
+2. mapping.csv: a file with the columns img_path and mask_path, where paths are relative to the folder or absolute.
+3. mapping_unique.csv: the same as above with an extra subj_id column, so that only one image per subject is presented for review.
+
+Cases without a mask are still loaded, and you can review them without a segmentation.
+
+### JSON Manifest Mode (Recommended)
+
+Select a manifest file that describes each sample. Every entry under samples can contain the following fields.
+
+1. case_id, image and label, which give the case name, the CT volume and the segmentation.
+2. hinge_points, contours, max_diameters, min_diameters and heights, which point to markup files in .mrk.json format.
+3. centerline, which can point to a markup file for the centerline points and to .vtp model files for the centerline curve and surface.
+
+A minimal example is shown below.
+
 ```json
 {
-  "name": "Full Dataset for TAVR-related Structure Segmentation",
-  "description": "101 CTA scans with Annotations for Aorta, Aortic Root and Left Ventricle annotations along with the measurements",
-  "modality": "CT",
-  "totaldatasample": 101,
   "samples": [
     {
-      "case_id": "568",
-      "image": "/Volumes/falcon/tavr_application/imgs/568.img.nii.gz",
-      "label": "/Volumes/falcon/tavr_application/stj_labels_corrected_v1/568.seg.nrrd",
-      "hinge_points": {
-        "LCC": "/Volumes/falcon/tavr_application/hinge_points/v2/568/LCC.mrk.json",
-        "RCC": "/Volumes/falcon/tavr_application/hinge_points/v2/568/RCC.mrk.json",
-        "NCC": "/Volumes/falcon/tavr_application/hinge_points/v2/568/NCC.mrk.json"
-      },
-      "contours": {
-        "annulus": "/Volumes/falcon/tavr_application/annulus_results_17/568/annulus_contour.mrk.json",
-        "sov": "/Volumes/falcon/tavr_application/sov/568/sov_contour.mrk.json",
-        "stj": "/Volumes/falcon/tavr_application/stj_contour/568/stj_contour.mrk.json"
-      },
-      "max_diameters": {
-        "annulus": "/Volumes/falcon/tavr_application/annulus_results_17/568/annulus_max_d.mrk.json",
-        "sov": "/Volumes/falcon/tavr_application/sov/568/sov_max_diameter_line.mrk.json",
-        "stj": "/Volumes/falcon/tavr_application/stj_contour/568/stj_max_d.mrk.json"
-      },
-      "min_diameters": {
-        "annulus": "/Volumes/falcon/tavr_application/annulus_results_17/568/annulus_min_d.mrk.json",
-        "sov": "/Volumes/falcon/tavr_application/sov/568/sov_min_diameter_line.mrk.json",
-        "stj": "/Volumes/falcon/tavr_application/stj_contour/568/stj_min_d.mrk.json"
-      },
-      "heights": {
-        "stj": "/Volumes/falcon/tavr_application/stj_heights/568/STJ_H.mrk.json",
-        "lch": "/Volumes/falcon/tavr_application/coronary_ostium_points/568/LCH.mrk.json",
-        "rch": "/Volumes/falcon/tavr_application/coronary_ostium_points/568/RCH.mrk.json"
-      }
+      "case_id": "case01",
+      "image": "/data/case01/image.nii.gz",
+      "label": "/data/case01/label.nii.gz",
+      "contours": { "annulus": "/data/case01/annulus.mrk.json" },
+      "hinge_points": { "LCC": "/data/case01/lcc.mrk.json" }
     }
   ]
 }
 ```
 
-Per sample, `case_id`, `image`, and `label` are the essentials; `hinge_points`, `contours`, `max_diameters`, `min_diameters`, and `heights` each hold named `.mrk.json` markup files that get loaded and (aside from `hinge_points`) show up as rows in the Measurement Review table. A `centerline` group is also supported, for `.mrk.json` markup points plus optional `.vtp` model files (e.g. `centerline.surface`, `centerline.curve`) used by the Centerline Slicing panel. Any extra fields your data has, like `dirs` or `aortic_angle`, are simply ignored by the extension.
+The Measurement Review table is built automatically from the markups found in your manifest.
 
-## Output files
+![Input panel](/TavrWorkbench/Screenshots/input_panel.png)
 
-Written into the same directory as your input:
+
+## Reviewing Cases
+
+1. Load a directory or a manifest. The first case opens automatically, and the counter at the top shows your position, for example Checked: 1 / 50.
+2. Inspect the volume, the segmentation and the markups in the slice and 3D views.
+3. Choose an overall rating of Acceptable, Minor correction or Not acceptable. This fills in every row of the review tables, and you can then change individual rows where they differ.
+4. Add a comment if needed. The Clear button resets all ratings for the current case.
+5. Click Save and Next, or press Shift+Return, to store the review and open the next case. An overall rating is required before saving.
+
+To move around the dataset, use Previous to return to an earlier case, where your ratings are restored, and Skip to move forward without saving anything. The Summary section shows the total number of samples, how many are reviewed and how many are pending.
+
+![Review panel](/TavrWorkbench/Screenshots/review_panel.png)
+
+## Modifying Segmentations
+
+The Segmentation Editor panel gives access to the standard Slicer editing tools such as Paint, Erase, Scissors, Smoothing and Islands. After correcting a mask, click Save Mask to write it as a .seg.nrrd file named after the case ID. The Markups panel is also available for adjusting points and contours.
+
+## View Tools
+
+View Alignment reorients the Red, Yellow and Green views to the plane of the annulus, SOV or STJ contour, or resets them to the default orientation. Centerline Slicing lets you move a slider along the centerline so that the views follow the vessel with a true cross section at every position.
+
+![View tools](/TavrWorkbench/Screenshots/view_tools.png)
+![View tools](/TavrWorkbench/Screenshots/view_tools_2.png)
+## Outputs
+
+All outputs are written to the input folder, or to the manifest folder in JSON mode.
 
 | File | Contents |
 |---|---|
@@ -91,8 +98,8 @@ Written into the same directory as your input:
 | `tavr_workbench.log` | Run log for troubleshooting |
 | `<case_id>.seg.nrrd` | Saved when you click **Save Mask** to overwrite a corrected segmentation |
 
-## Contributors
+When you reopen the same dataset, cases already listed in annotations.csv are skipped, so you can stop and resume a review session at any time.
 
-Mohammed Khubaib (Saeed Lab, Florida International University), under the supervision of Dr. Fahad Saeed and Dr. Kaoutar Ben Ahmed.
+## Acknowledgements
 
-## License
+Developed by Mohammed Khubaib, M.S. Computer Engineering, Florida International University, as part of the Saeed Lab under the supervision of Dr. Fahad Saeed and Dr. Kaoutar Ben Ahmed.
