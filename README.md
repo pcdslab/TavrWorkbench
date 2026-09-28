@@ -5,13 +5,13 @@
 </p>
 TavrWorkbench is a 3D Slicer extension for fast and structured review of TAVR CT segmentations and measurements. It lets a reviewer step through a dataset case by case, inspect the CT volume together with its segmentation and anatomical markups, rate the quality of each result, correct the mask when needed, and export everything to a clean annotation file.
 
-![TavrWorkbench main panel](/TavrWorkbench/Screenshots/main_panel.png)
+![TavrWorkbench main panel](/Screenshots/main_panel.png)
 
 ## Use Case
 
 Automated TAVR pipelines produce segmentations of the aorta, aortic root, left ventricle, coronaries and thoracic aorta, along with measurements such as annulus, sinus of Valsalva (SOV) and sinotubular junction (STJ) contours, diameters, hinge points, heights and centerlines. Before these outputs can be trusted for research or planning, an expert has to check them. TavrWorkbench turns that check into a quick and repeatable workflow, where each case receives an overall rating, a rating for every segmentation label and measurement, and an optional comment. Cases that need small fixes can be edited right inside the same module.
 
-![Review workflow](/TavrWorkbench/Screenshots/review_workflow.png)
+![Review workflow](/Screenshots/review_workflow.png)
 
 
 ## Installation
@@ -62,7 +62,7 @@ A minimal example is shown below.
 
 The Measurement Review table is built automatically from the markups found in your manifest.
 
-![Input panel](/TavrWorkbench/Screenshots/input_panel.png)
+![Input panel](/Screenshots/input_panel.png)
 
 
 ## Reviewing Cases
@@ -75,7 +75,7 @@ The Measurement Review table is built automatically from the markups found in yo
 
 To move around the dataset, use Previous to return to an earlier case, where your ratings are restored, and Skip to move forward without saving anything. The Summary section shows the total number of samples, how many are reviewed and how many are pending.
 
-![Review panel](/TavrWorkbench/Screenshots/review_panel.png)
+![Review panel](/Screenshots/review_panel.png)
 
 ## Modifying Segmentations
 
@@ -85,8 +85,8 @@ The Segmentation Editor panel gives access to the standard Slicer editing tools 
 
 View Alignment reorients the Red, Yellow and Green views to the plane of the annulus, SOV or STJ contour, or resets them to the default orientation. Centerline Slicing lets you move a slider along the centerline so that the views follow the vessel with a true cross section at every position.
 
-![View tools](/TavrWorkbench/Screenshots/view_tools.png)
-![View tools](/TavrWorkbench/Screenshots/view_tools_2.png)
+![View tools](/Screenshots/view_tools.png)
+![View tools](/Screenshots/view_tools_2.png)
 ## Outputs
 
 All outputs are written to the input folder, or to the manifest folder in JSON mode.
