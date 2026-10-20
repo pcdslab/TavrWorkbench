@@ -18,12 +18,6 @@ import SegmentStatistics
 # Suppress VTK warnings globally to prevent console flooding and UI freezing
 vtk.vtkObject.GlobalWarningDisplayOff()
 
-try:
-    import numpy as np
-except:
-    slicer.util.pip_install('numpy')
-    import numpy as np
-
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -184,10 +178,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.segment_visiblity_states = {}
         self.loaded_markup_nodes = []
         self.loaded_model_nodes = []
-        self.contour_nodes_by_label = {}
-        self.centerline_nodes_by_label = {}
-        self.centerline_points_world = {}
-        self.centerline_arclength = {}
 
         # ---- Case list / progress tracking (data-map + output folder) ----
         self.samples = []
@@ -250,8 +240,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui = slicer.util.childWidgetVariables(uiWidget)
         uiWidget.setMRMLScene(slicer.mrmlScene)
 
-        self._createAlignmentWidget_()
-        self._createCenterlineSlicingWidget_()
         self.logic = TavrWorkbenchLogic()
 
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.StartCloseEvent, self.onSceneStartClose)
@@ -817,243 +805,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         slicer.util.infoDisplay(f"Segmentation saved successfully as:\n{path}")
 
     # ------------------------------------------------------------------
-    # View alignment
-    # ------------------------------------------------------------------
-    def _createAlignmentWidget_(self):
-        alignmentCollapsibleButton = ctk.ctkCollapsibleButton()
-        alignmentCollapsibleButton.text = "View Alignment"
-        self.layout.addWidget(alignmentCollapsibleButton)
-        alignmentFormLayout = qt.QFormLayout(alignmentCollapsibleButton)
-
-        self.alignmentTargetComboBox = qt.QComboBox()
-        self.alignmentTargetComboBox.addItem("Default orientation")
-        self.alignmentTargetComboBox.addItem("contours.annulus")
-        self.alignmentTargetComboBox.addItem("contours.sov")
-        self.alignmentTargetComboBox.addItem("contours.stj")
-        self.alignmentTargetComboBox.setCurrentIndex(1)
-        alignmentFormLayout.addRow("Alignment target:", self.alignmentTargetComboBox)
-
-        self.applyAlignmentButton = qt.QPushButton("Apply Alignment / Reset Views")
-        self.applyAlignmentButton.connect('clicked(bool)', self.onApplyAlignmentClicked)
-        alignmentFormLayout.addRow(self.applyAlignmentButton)
-
-    def onApplyAlignmentClicked(self):
-        if not hasattr(self, "alignmentTargetComboBox") or self.alignmentTargetComboBox is None:
-            return
-        target = str(self.alignmentTargetComboBox.currentText).strip().lower()
-        if target in ["default orientation", "default", "reset", "reset views", "default views"]:
-            self.reset_views_to_default()
-            return
-        contour_node = self.contour_nodes_by_label.get(target, None)
-        if contour_node is None:
-            slicer.util.warningDisplay(
-                f"No loaded markup found for '{target}'.\n\n"
-                "Load a case that contains this contour, or choose another target."
-            )
-            return
-        self.align_views_to_contour(contour_node, target)
-
-    # ------------------------------------------------------------------
-    # Centerline slicing (slider-driven CPR-style axial alignment)
-    # ------------------------------------------------------------------
-    def _createCenterlineSlicingWidget_(self):
-        centerlineCollapsibleButton = ctk.ctkCollapsibleButton()
-        centerlineCollapsibleButton.text = "Centerline Slicing"
-        self.layout.addWidget(centerlineCollapsibleButton)
-        centerlineLayout = qt.QFormLayout(centerlineCollapsibleButton)
-
-        self.centerlineTargetComboBox = qt.QComboBox()
-        self.centerlineTargetComboBox.addItem("No centerline loaded")
-        self.centerlineTargetComboBox.setEnabled(False)
-        centerlineLayout.addRow("Centerline:", self.centerlineTargetComboBox)
-
-        self.centerlineEnableCheckBox = qt.QCheckBox("Lock axial (Red) view to centerline")
-        self.centerlineEnableCheckBox.setChecked(False)
-        self.centerlineEnableCheckBox.setEnabled(False)
-        centerlineLayout.addRow(self.centerlineEnableCheckBox)
-
-        sliderLayout = qt.QHBoxLayout()
-        self.centerlineSlider = qt.QSlider(qt.Qt.Horizontal)
-        self.centerlineSlider.setMinimum(0)
-        self.centerlineSlider.setMaximum(0)
-        self.centerlineSlider.setEnabled(False)
-        self.centerlinePositionLabel = qt.QLabel("0 / 0  (0.0 mm)")
-        self.centerlinePositionLabel.setMinimumWidth(140)
-        sliderLayout.addWidget(self.centerlineSlider)
-        sliderLayout.addWidget(self.centerlinePositionLabel)
-        centerlineLayout.addRow("Position:", sliderLayout)
-
-        self.centerlineSliceSizeSpinBox = qt.QDoubleSpinBox()
-        self.centerlineSliceSizeSpinBox.setRange(10.0, 300.0)
-        self.centerlineSliceSizeSpinBox.setSingleStep(5.0)
-        self.centerlineSliceSizeSpinBox.setValue(80.0)
-        self.centerlineSliceSizeSpinBox.setSuffix(" mm")
-        centerlineLayout.addRow("Cross-section size:", self.centerlineSliceSizeSpinBox)
-
-        self.centerlineTargetComboBox.currentIndexChanged.connect(self.onCenterlineTargetChanged)
-        self.centerlineEnableCheckBox.toggled.connect(self.onCenterlineEnableToggled)
-        self.centerlineSlider.valueChanged.connect(self.onCenterlineSliderChanged)
-        self.centerlineSliceSizeSpinBox.valueChanged.connect(self.onCenterlineSliceSizeChanged)
-
-    def _centerline_tangent(self, points, index):
-        n = points.shape[0]
-        if n < 2:
-            return np.array([0.0, 0.0, 1.0])
-        i0 = max(0, index - 1)
-        i1 = min(n - 1, index + 1)
-        if i0 == i1:
-            return np.array([0.0, 0.0, 1.0])
-        tangent = points[i1] - points[i0]
-        norm = np.linalg.norm(tangent)
-        if norm < 1e-6:
-            return np.array([0.0, 0.0, 1.0])
-        return tangent / norm
-
-    def _compute_centerline_arrays(self, label, node):
-        points = self._get_markup_points_world(node) if node is not None else None
-        if points is None or points.shape[0] < 2:
-            self.centerline_points_world[label] = None
-            self.centerline_arclength[label] = None
-            return
-        diffs = np.diff(points, axis=0)
-        seglen = np.linalg.norm(diffs, axis=1)
-        cumulative = np.concatenate([[0.0], np.cumsum(seglen)])
-        self.centerline_points_world[label] = points
-        self.centerline_arclength[label] = cumulative
-
-    def _refreshCenterlineTargets(self):
-        if not hasattr(self, "centerlineTargetComboBox"):
-            return
-
-        self.centerlineTargetComboBox.blockSignals(True)
-        self.centerlineTargetComboBox.clear()
-
-        labels = sorted(self.centerline_nodes_by_label.keys())
-        if not labels:
-            self.centerlineTargetComboBox.addItem("No centerline loaded")
-            self.centerlineTargetComboBox.setEnabled(False)
-            self.centerlineEnableCheckBox.setEnabled(False)
-            self.centerlineEnableCheckBox.setChecked(False)
-            self.centerlineSlider.setEnabled(False)
-            self.centerlineSlider.setMaximum(0)
-            self.centerlinePositionLabel.setText("0 / 0  (0.0 mm)")
-            self.centerlineTargetComboBox.blockSignals(False)
-            return
-
-        preferred = "centerline.points"
-        for label in labels:
-            self._compute_centerline_arrays(label, self.centerline_nodes_by_label[label])
-            self.centerlineTargetComboBox.addItem(label)
-
-        default_index = labels.index(preferred) if preferred in labels else 0
-        self.centerlineTargetComboBox.setCurrentIndex(default_index)
-        self.centerlineTargetComboBox.setEnabled(True)
-        self.centerlineEnableCheckBox.setEnabled(True)
-        self.centerlineTargetComboBox.blockSignals(False)
-
-        self._updateCenterlineSliderRange()
-
-    def _updateCenterlineSliderRange(self):
-        label = self.centerlineTargetComboBox.currentText
-        points = self.centerline_points_world.get(label)
-        if points is None or points.shape[0] < 2:
-            self.centerlineSlider.setEnabled(False)
-            self.centerlineSlider.setMaximum(0)
-            self.centerlinePositionLabel.setText("0 / 0  (0.0 mm)")
-            return
-        self.centerlineSlider.blockSignals(True)
-        self.centerlineSlider.setMinimum(0)
-        self.centerlineSlider.setMaximum(points.shape[0] - 1)
-        self.centerlineSlider.setValue(0)
-        self.centerlineSlider.blockSignals(False)
-        self.centerlineSlider.setEnabled(True)
-        self._updateCenterlinePositionLabel(0)
-        if self.centerlineEnableCheckBox.isChecked():
-            self._applyCenterlineSlicePosition(0)
-
-    def _updateCenterlinePositionLabel(self, index):
-        label = self.centerlineTargetComboBox.currentText
-        points = self.centerline_points_world.get(label)
-        cumulative = self.centerline_arclength.get(label)
-        if points is None:
-            self.centerlinePositionLabel.setText("0 / 0  (0.0 mm)")
-            return
-        n = points.shape[0]
-        dist = cumulative[index] if cumulative is not None else 0.0
-        self.centerlinePositionLabel.setText(f"{index + 1} / {n}  ({dist:.1f} mm)")
-
-    def onCenterlineTargetChanged(self, _index=None):
-        self._updateCenterlineSliderRange()
-
-    def onCenterlineEnableToggled(self, checked):
-        if checked:
-            self._applyCenterlineSlicePosition(self.centerlineSlider.value)
-
-    def onCenterlineSliceSizeChanged(self, _value=None):
-        if self.centerlineEnableCheckBox.isChecked():
-            self._applyCenterlineSlicePosition(self.centerlineSlider.value)
-
-    def onCenterlineSliderChanged(self, value):
-        self._updateCenterlinePositionLabel(value)
-        if not self.centerlineEnableCheckBox.isChecked():
-            return
-        self._applyCenterlineSlicePosition(value)
-
-    def _applyCenterlineSlicePosition(self, index):
-        label = self.centerlineTargetComboBox.currentText
-        points = self.centerline_points_world.get(label)
-        if points is None or points.shape[0] == 0:
-            return
-        index = int(max(0, min(index, points.shape[0] - 1)))
-        point = points[index]
-        tangent = self._centerline_tangent(points, index)
-        x_axis, y_axis, z_axis = self._orthogonal_axes_from_normal(tangent)
-
-        layoutManager = slicer.app.layoutManager()
-        view_names = layoutManager.sliceViewNames()
-        if len(view_names) < 1:
-            return
-        if len(view_names) < 3:
-            try:
-                four_up = getattr(slicer.vtkMRMLLayoutNode, "SlicerLayoutFourUp", None)
-                if four_up is not None:
-                    layoutManager.setLayout(four_up)
-                    slicer.app.processEvents()
-                    view_names = layoutManager.sliceViewNames()
-            except Exception as e:
-                print(f"[Centerline] Could not switch layout to Four-Up: {e}")
-        if self.volume_node:
-            try:
-                slicer.util.setSliceViewerLayers(background=self.volume_node)
-            except Exception as e:
-                print(f"[Centerline] Could not re-set background volume: {e}")
-
-        fov_size = float(self.centerlineSliceSizeSpinBox.value) if hasattr(self, "centerlineSliceSizeSpinBox") else 80.0
-        shared_fov = (fov_size, fov_size)
-
-        red_view = "Red" if "Red" in view_names else (view_names[0] if len(view_names) > 0 else None)
-        yellow_view = "Yellow" if "Yellow" in view_names else (view_names[1] if len(view_names) > 1 else None)
-        green_view = "Green" if "Green" in view_names else (view_names[2] if len(view_names) > 2 else None)
-
-        if red_view:
-            self._set_slice_view_plane(red_view, x_axis, y_axis, z_axis, point, shared_fov)
-        else:
-            print("[Centerline] No Red-equivalent slice view found.")
-        if yellow_view:
-            self._set_slice_view_plane(yellow_view, x_axis, z_axis, -y_axis, point, shared_fov)
-        else:
-            print("[Centerline] No Yellow-equivalent slice view found.")
-        if green_view:
-            self._set_slice_view_plane(green_view, y_axis, z_axis, x_axis, point, shared_fov)
-        else:
-            print("[Centerline] No Green-equivalent slice view found.")
-
-        try:
-            layoutManager.forceRender()
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
     # Segmentation loading
     # ------------------------------------------------------------------
     def _load_segmentation_flexible(self, path):
@@ -1148,367 +899,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 pass
 
     # ------------------------------------------------------------------
-    # Geometry helpers
-    # ------------------------------------------------------------------
-    def _get_markup_points_world(self, markup_node):
-        points = []
-        for methodName in ["GetCurvePointsWorld", "GetCurveWorld"]:
-            if not hasattr(markup_node, methodName):
-                continue
-            try:
-                obj = getattr(markup_node, methodName)()
-                if obj is None:
-                    continue
-                vtk_points = None
-                if hasattr(obj, "GetNumberOfPoints") and hasattr(obj, "GetPoint"):
-                    vtk_points = obj
-                elif hasattr(obj, "GetPoints"):
-                    vtk_points = obj.GetPoints()
-                if vtk_points is not None:
-                    n = vtk_points.GetNumberOfPoints()
-                    for i in range(n):
-                        points.append(list(vtk_points.GetPoint(i)))
-                    if len(points) >= 3:
-                        return np.array(points, dtype=float)
-            except Exception as e:
-                print(f"[Alignment] Dense point extraction failed using {methodName}: {e}")
-        if hasattr(markup_node, "GetNumberOfControlPoints"):
-            n = markup_node.GetNumberOfControlPoints()
-            for i in range(n):
-                p = [0.0, 0.0, 0.0]
-                try:
-                    if hasattr(markup_node, "GetNthControlPointPositionWorld"):
-                        markup_node.GetNthControlPointPositionWorld(i, p)
-                    else:
-                        markup_node.GetNthControlPointPosition(i, p)
-                    points.append(p)
-                except Exception as e:
-                    print(f"[Alignment] Failed to get control point {i}: {e}")
-        return np.array(points, dtype=float)
-
-    def _orthogonal_axes_from_normal(self, normal):
-        n = np.array(normal, dtype=float)
-        n_norm = np.linalg.norm(n)
-        if n_norm < 1e-9:
-            return np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])
-        n /= n_norm
-        reference_axes = [
-            np.array([1.0, 0.0, 0.0]),
-            np.array([0.0, 1.0, 0.0]),
-            np.array([0.0, 0.0, 1.0]),
-        ]
-        x_axis = None
-        for ref in reference_axes:
-            candidate = ref - np.dot(ref, n) * n
-            candidate_norm = np.linalg.norm(candidate)
-            if candidate_norm > 1e-3:
-                x_axis = candidate / candidate_norm
-                break
-        if x_axis is None:
-            x_axis = np.array([1.0, 0.0, 0.0])
-        y_axis = np.cross(n, x_axis)
-        y_norm = np.linalg.norm(y_axis)
-        if y_norm < 1e-9:
-            y_axis = np.array([0.0, 1.0, 0.0])
-        else:
-            y_axis /= y_norm
-        x_axis = np.cross(y_axis, n)
-        x_norm = np.linalg.norm(x_axis)
-        if x_norm < 1e-9:
-            x_axis = np.array([1.0, 0.0, 0.0])
-        else:
-            x_axis /= x_norm
-        return x_axis, y_axis, n
-
-    def _required_square_fov_for_plane(self, points, origin, x_axis, y_axis, margin=1.8, min_size=60.0):
-        if points is None or len(points) == 0:
-            return min_size, min_size
-        v = points - origin
-        xs = np.dot(v, x_axis)
-        ys = np.dot(v, y_axis)
-        range_x = float(np.max(xs) - np.min(xs)) if xs.size else 0.0
-        range_y = float(np.max(ys) - np.min(ys)) if ys.size else 0.0
-        extent = max(range_x, range_y, float(min_size))
-        fov = extent * float(margin)
-        return fov, fov
-
-    def _set_slice_view_plane(self, view_name, x_axis, y_axis, z_axis, origin, required_fov=None):
-        layoutManager = slicer.app.layoutManager()
-        sliceWidget = layoutManager.sliceWidget(view_name)
-        if not sliceWidget:
-            print(f"[Alignment] Slice view {view_name} not found.")
-            return False
-        sliceNode = sliceWidget.mrmlSliceNode()
-        if not sliceNode:
-            print(f"[Alignment] Slice node for {view_name} not found.")
-            return False
-        sliceLogic = None
-        try:
-            sliceLogic = slicer.app.applicationLogic().GetSliceLogic(sliceNode)
-        except Exception:
-            sliceLogic = None
-        if sliceLogic is None:
-            try:
-                sliceLogic = sliceWidget.sliceLogic()
-            except Exception:
-                sliceLogic = None
-        x = np.array(x_axis, dtype=float)
-        y = np.array(y_axis, dtype=float)
-        x_norm = np.linalg.norm(x)
-        if x_norm < 1e-9:
-            print(f"[Alignment] Invalid X axis for {view_name}.")
-            return False
-        x /= x_norm
-        y = y - np.dot(y, x) * x
-        y_norm = np.linalg.norm(y)
-        if y_norm < 1e-9:
-            fallback = np.array([0.0, 0.0, 1.0])
-            y = np.cross(fallback, x)
-            y_norm = np.linalg.norm(y)
-            if y_norm < 1e-9:
-                fallback = np.array([1.0, 0.0, 0.0])
-                y = np.cross(fallback, x)
-                y_norm = np.linalg.norm(y)
-        y /= y_norm
-        z = np.cross(x, y)
-        z_norm = np.linalg.norm(z)
-        if z_norm < 1e-9:
-            print(f"[Alignment] Could not construct a valid Z axis for {view_name}.")
-            return False
-        z /= z_norm
-        transform = vtk.vtkMatrix4x4()
-        transform.Identity()
-        for i in range(3):
-            transform.SetElement(i, 0, float(x[i]))
-            transform.SetElement(i, 1, float(y[i]))
-            transform.SetElement(i, 2, float(z[i]))
-            transform.SetElement(i, 3, float(origin[i]))
-        wasModified = sliceNode.StartModify()
-        try:
-            orientation_set = False
-            for methodName in ["SetOrientationToReformat", "SetOrientationToUser"]:
-                if hasattr(sliceNode, methodName):
-                    try:
-                        getattr(sliceNode, methodName)()
-                        orientation_set = True
-                        break
-                    except Exception as e:
-                        print(f"[Alignment] {view_name}: {methodName} failed: {e}")
-            if not orientation_set:
-                try:
-                    sliceNode.SetOrientation("Reformat")
-                except Exception as e:
-                    print(f"[Alignment] {view_name}: SetOrientation('Reformat') failed: {e}")
-            if hasattr(sliceNode, "SetSliceToRAS"):
-                try:
-                    sliceNode.SetSliceToRAS(transform)
-                except Exception as e:
-                    print(f"[Alignment] {view_name}: SetSliceToRAS failed: {e}")
-            try:
-                sliceNode.GetSliceToRAS().DeepCopy(transform)
-            except Exception as e:
-                print(f"[Alignment] {view_name}: DeepCopy SliceToRAS failed: {e}")
-            try:
-                sliceNode.UpdateMatrices()
-            except Exception as e:
-                print(f"[Alignment] {view_name}: UpdateMatrices failed: {e}")
-            if hasattr(sliceNode, "JumpSlice"):
-                try:
-                    sliceNode.JumpSlice(float(origin[0]), float(origin[1]), float(origin[2]))
-                except Exception as e:
-                    print(f"[Alignment] {view_name}: JumpSlice failed: {e}")
-            sliceNode.Modified()
-        finally:
-            sliceNode.EndModify(wasModified)
-        if sliceLogic:
-            try:
-                sliceLogic.FitSliceToAll()
-            except Exception as e:
-                print(f"[Alignment] {view_name}: FitSliceToAll failed: {e}")
-        if hasattr(sliceNode, "JumpSlice"):
-            try:
-                sliceNode.JumpSlice(float(origin[0]), float(origin[1]), float(origin[2]))
-            except Exception:
-                pass
-        if required_fov:
-            if hasattr(sliceNode, "SetFieldOfView"):
-                wasModified = sliceNode.StartModify()
-                try:
-                    sliceNode.SetFieldOfView(float(required_fov[0]), float(required_fov[1]))
-                except Exception as e:
-                    print(f"[Alignment] {view_name}: SetFieldOfView failed: {e}")
-                finally:
-                    sliceNode.EndModify(wasModified)
-            elif sliceLogic and hasattr(sliceLogic, "FitSliceToContent"):
-                try:
-                    sliceLogic.FitSliceToContent()
-                except Exception as e:
-                    print(f"[Alignment] {view_name}: FitSliceToContent failed: {e}")
-            if hasattr(sliceNode, "JumpSlice"):
-                try:
-                    sliceNode.JumpSlice(float(origin[0]), float(origin[1]), float(origin[2]))
-                except Exception:
-                    pass
-        try:
-            sliceWidget.forceRender()
-        except Exception:
-            pass
-        return True
-
-    def align_views_to_contour(self, curve_node, contour_label="contour"):
-        if not curve_node:
-            print("[Alignment] No contour node provided.")
-            return
-        node_name = curve_node.GetName() if hasattr(curve_node, "GetName") else "unknown"
-        print(f"[Alignment] Aligning views using contour: {contour_label} ({node_name})")
-        points = self._get_markup_points_world(curve_node)
-        if points.size == 0 or points.shape[0] < 3:
-            slicer.util.warningDisplay(f"Not enough points were found in '{contour_label}' to define a plane.")
-            return
-        if not np.all(np.isfinite(points)):
-            slicer.util.warningDisplay(f"Contour points for '{contour_label}' contain invalid coordinates.")
-            return
-        centroid = np.mean(points, axis=0)
-        centered = points - centroid
-        if np.linalg.norm(centered) < 1e-6:
-            slicer.util.warningDisplay(f"Contour points for '{contour_label}' are degenerate.")
-            return
-        try:
-            u, s, vh = np.linalg.svd(centered)
-        except Exception as e:
-            slicer.util.warningDisplay(f"Plane fitting failed for '{contour_label}': {e}")
-            return
-        normal = vh[2].astype(float)
-        if np.linalg.norm(normal) < 1e-9:
-            slicer.util.warningDisplay(f"Could not compute a plane normal for '{contour_label}'.")
-            return
-        if normal[2] < 0:
-            normal = -normal
-        x_axis, y_axis, z_axis = self._orthogonal_axes_from_normal(normal)
-        layoutManager = slicer.app.layoutManager()
-        if len(layoutManager.sliceViewNames()) < 3:
-            try:
-                four_up = getattr(slicer.vtkMRMLLayoutNode, "SlicerLayoutFourUp", None)
-                if four_up is not None:
-                    layoutManager.setLayout(four_up)
-                    slicer.app.processEvents()
-            except Exception as e:
-                print(f"[Alignment] Could not switch layout to Four-Up: {e}")
-        if self.volume_node:
-            try:
-                slicer.util.setSliceViewerLayers(background=self.volume_node)
-            except Exception as e:
-                print(f"[Alignment] Could not re-set background volume: {e}")
-        shared_fov = self._required_square_fov_for_plane(
-            points, centroid, x_axis, y_axis, margin=1.8, min_size=60.0
-        )
-        view_names = layoutManager.sliceViewNames()
-        red_view = "Red" if "Red" in view_names else (view_names[0] if len(view_names) > 0 else None)
-        yellow_view = "Yellow" if "Yellow" in view_names else (view_names[1] if len(view_names) > 1 else None)
-        green_view = "Green" if "Green" in view_names else (view_names[2] if len(view_names) > 2 else None)
-        if red_view:
-            self._set_slice_view_plane(red_view, x_axis, y_axis, z_axis, centroid, shared_fov)
-        if yellow_view:
-            self._set_slice_view_plane(yellow_view, x_axis, z_axis, -y_axis, centroid, shared_fov)
-        if green_view:
-            self._set_slice_view_plane(green_view, y_axis, z_axis, x_axis, centroid, shared_fov)
-        try:
-            layoutManager.forceRender()
-        except Exception:
-            pass
-
-    def align_views_to_annulus(self, curve_node):
-        self.align_views_to_contour(curve_node, "contours.annulus")
-
-    def _set_standard_slice_orientation(self, sliceNode, orientation_name):
-        if not sliceNode:
-            return False
-        method_map = {
-            "Axial": "SetOrientationToAxial",
-            "Sagittal": "SetOrientationToSagittal",
-            "Coronal": "SetOrientationToCoronal",
-        }
-        method_name = method_map.get(orientation_name)
-        if method_name and hasattr(sliceNode, method_name):
-            try:
-                getattr(sliceNode, method_name)()
-                return True
-            except Exception as e:
-                print(f"[Alignment] {method_name} failed: {e}")
-        try:
-            sliceNode.SetOrientation(orientation_name)
-            return True
-        except Exception as e:
-            print(f"[Alignment] SetOrientation('{orientation_name}') failed: {e}")
-        return False
-
-    def _reset_one_slice_view_to_orientation(self, view_name, orientation_name):
-        if not view_name:
-            return
-        layoutManager = slicer.app.layoutManager()
-        sliceWidget = layoutManager.sliceWidget(view_name)
-        if not sliceWidget:
-            return
-        sliceNode = sliceWidget.mrmlSliceNode()
-        if not sliceNode:
-            return
-        wasModified = sliceNode.StartModify()
-        try:
-            self._set_standard_slice_orientation(sliceNode, orientation_name)
-            try:
-                sliceNode.UpdateMatrices()
-            except Exception:
-                pass
-        finally:
-            sliceNode.EndModify(wasModified)
-        sliceLogic = None
-        try:
-            sliceLogic = slicer.app.applicationLogic().GetSliceLogic(sliceNode)
-        except Exception:
-            sliceLogic = None
-        if sliceLogic is None:
-            try:
-                sliceLogic = sliceWidget.sliceLogic()
-            except Exception:
-                sliceLogic = None
-        if sliceLogic:
-            try:
-                sliceLogic.FitSliceToAll()
-            except Exception:
-                pass
-        try:
-            sliceWidget.forceRender()
-        except Exception:
-            pass
-
-    def reset_views_to_default(self):
-        layoutManager = slicer.app.layoutManager()
-        if len(layoutManager.sliceViewNames()) < 3:
-            try:
-                four_up = getattr(slicer.vtkMRMLLayoutNode, "SlicerLayoutFourUp", None)
-                if four_up is not None:
-                    layoutManager.setLayout(four_up)
-                    slicer.app.processEvents()
-            except Exception as e:
-                print(f"[Alignment] Could not switch layout to Four-Up: {e}")
-        if self.volume_node:
-            try:
-                slicer.util.setSliceViewerLayers(background=self.volume_node)
-            except Exception as e:
-                print(f"[Alignment] Could not set background volume during reset: {e}")
-        view_names = layoutManager.sliceViewNames()
-        red_view = "Red" if "Red" in view_names else (view_names[0] if len(view_names) > 0 else None)
-        yellow_view = "Yellow" if "Yellow" in view_names else (view_names[1] if len(view_names) > 1 else None)
-        green_view = "Green" if "Green" in view_names else (view_names[2] if len(view_names) > 2 else None)
-        self._reset_one_slice_view_to_orientation(red_view, "Axial")
-        self._reset_one_slice_view_to_orientation(yellow_view, "Sagittal")
-        self._reset_one_slice_view_to_orientation(green_view, "Coronal")
-        try:
-            layoutManager.forceRender()
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
     # Case loading
     # ------------------------------------------------------------------
     def _clearCaseNodes(self):
@@ -1539,10 +929,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.volume_node = None
         self.segmentation_node = None
         self.pointListNode = None
-        self.contour_nodes_by_label = {}
-        self.centerline_nodes_by_label = {}
-        self.centerline_points_world = {}
-        self.centerline_arclength = {}
 
     def _loadCaseData(self):
         self._clearCaseNodes()
@@ -1574,7 +960,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 slicer.util.errorDisplay(f"Could not load volume for case {cid}:\n{image_path}\n\n{e}")
                 self.volume_node = None
             if self.volume_node is None:
-                self._refreshCenterlineTargets()
                 return
             slicer.util.setSliceViewerLayers(background=self.volume_node)
             self.restore_window_level_settings()
@@ -1610,11 +995,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                             except Exception:
                                 pass
                         self.loaded_markup_nodes.append(markupNode)
-                        lower_label = label.lower()
-                        if lower_label in ["contours.annulus", "contours.sov", "contours.stj"]:
-                            self.contour_nodes_by_label[lower_label] = markupNode
-                        if lower_label.startswith("centerline."):
-                            self.centerline_nodes_by_label[lower_label] = markupNode
                     else:
                         print(f"[TavrWorkbench] WARNING: loadMarkups returned None for {label}: {path}")
                 except Exception as e:
@@ -1660,19 +1040,13 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             except Exception as e:
                 print(f"[TavrWorkbench] WARNING: FitSliceToAll failed for {sliceViewName}: {e}")
 
+        # Make a contour (or otherwise the first markup) the active markups list
         active_markup = None
-        selected_alignment = ""
-        if hasattr(self, "alignmentTargetComboBox") and self.alignmentTargetComboBox is not None:
-            selected_alignment = str(self.alignmentTargetComboBox.currentText).strip().lower()
-        if selected_alignment in self.contour_nodes_by_label:
-            active_markup = self.contour_nodes_by_label[selected_alignment]
-        elif "contours.annulus" in self.contour_nodes_by_label:
-            active_markup = self.contour_nodes_by_label["contours.annulus"]
-        elif "contours.sov" in self.contour_nodes_by_label:
-            active_markup = self.contour_nodes_by_label["contours.sov"]
-        elif "contours.stj" in self.contour_nodes_by_label:
-            active_markup = self.contour_nodes_by_label["contours.stj"]
-        elif self.loaded_markup_nodes:
+        for preferred in ("contours.annulus", "contours.sov", "contours.stj"):
+            active_markup = next((n for n in self.loaded_markup_nodes if (n.GetName() or "").lower() == preferred), None)
+            if active_markup is not None:
+                break
+        if active_markup is None and self.loaded_markup_nodes:
             active_markup = self.loaded_markup_nodes[0]
         if active_markup is not None:
             try:
@@ -1683,7 +1057,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 except Exception as e:
                     print(f"[TavrWorkbench] WARNING: could not set active markup node: {e}")
         self._enableMarkupsWidgetOptions()
-        self._refreshCenterlineTargets()
 
     # ------------------------------------------------------------------
     # Segment editor / markups widgets
@@ -1848,8 +1221,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.pointListNode = None
         self.loaded_markup_nodes = []
         self.loaded_model_nodes = []
-        self.contour_nodes_by_label = {}
-        self.centerline_nodes_by_label = {}
         self._case_loaded = False
 
     def onSceneEndClose(self, caller, event):
