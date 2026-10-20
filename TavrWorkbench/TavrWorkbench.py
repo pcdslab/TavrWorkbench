@@ -1,8 +1,11 @@
+# TavrWorkbench.py
+import csv
+import json
 import logging
 import os
+from datetime import datetime
+
 import vtk
-import pathlib
-from pathlib import Path
 import slicer
 from slicer.i18n import tr as _
 from slicer.i18n import translate
@@ -11,22 +14,15 @@ from slicer.util import VTKObservationMixin
 import ctk
 import qt
 import SegmentStatistics
-import json
 
 # Suppress VTK warnings globally to prevent console flooding and UI freezing
 vtk.vtkObject.GlobalWarningDisplayOff()
 
 try:
-    import pandas as pd
     import numpy as np
-    import SimpleITK as sitk
 except:
-    slicer.util.pip_install('pandas')
     slicer.util.pip_install('numpy')
-    slicer.util.pip_install('SimpleITK')
-    import pandas as pd
     import numpy as np
-    import SimpleITK as sitk
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -34,10 +30,32 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 # Review constants
 # ---------------------------------------------------------------------------
-RATING_ACCEPTABLE = "acceptable"
-RATING_MINOR = "minor"
-RATING_NOT_ACCEPTABLE = "not_acceptable"
+RATING_ACCEPT = "accepted"
+RATING_FLAG = "flagged"
 RATING_NONE = ""
+
+# Reviews/status saved with the old 3-option scheme are mapped onto the 2-option one when read.
+LEGACY_RATING_MAP = {
+    "acceptable": RATING_ACCEPT,
+    "minor": RATING_FLAG,
+    "not_acceptable": RATING_FLAG,
+}
+
+
+def normalize_rating(value):
+    value = LEGACY_RATING_MAP.get(value, value)
+    return value if value in (RATING_ACCEPT, RATING_FLAG) else RATING_NONE
+
+
+def normalize_review(review):
+    if not isinstance(review, dict):
+        return None
+    out = dict(review)
+    out["overall"] = normalize_rating(review.get("overall", RATING_NONE))
+    for key in ("segmentation", "measurements"):
+        out[key] = {k: normalize_rating(v) for k, v in (review.get(key) or {}).items()}
+    out.setdefault("comment", "")
+    return out
 
 SEGMENTATION_LABELS = [
     "Aorta",
@@ -68,22 +86,44 @@ MEASUREMENT_KEY_TO_LABEL = {
 
 ALL_MEASUREMENT_COLUMNS = list(MEASUREMENT_KEY_TO_LABEL.values())
 
+# Group keys in a manifest sample that hold markup / model paths
+MARKUP_GROUP_KEYS = ["hinge_points", "contours", "max_diameters", "min_diameters", "heights", "centerline"]
+MODEL_EXTENSIONS = ('.vtp',)
+
+# Keyboard shortcuts for the overall decision. Shift+<letter> is identical on Windows, macOS
+# and Linux (unlike Ctrl/Alt/Meta, which are remapped per platform) and doesn't collide with
+# Slicer's Ctrl+<n> layout shortcuts. Change here if you prefer other keys.
+SHORTCUT_ACCEPT = "Shift+A"   # A for Approve
+SHORTCUT_FLAG = "Shift+F"
+
+# Output-folder file names
+STATUS_FILE = "review_status.json"
+CSV_FILE = "annotations.csv"
+CASE_REVIEW_FILE = "review.json"
+CASE_MASK_FILE = "segmentation.seg.nrrd"
+
+RATING_TO_STR = {
+    RATING_ACCEPT: "✓ Approved",
+    RATING_FLAG: "⚑ Flagged for review",
+    RATING_NONE: "",
+}
+RATING_TO_MARK = {
+    RATING_ACCEPT: "✓",
+    RATING_FLAG: "⚑",
+}
+
 
 class TavrWorkbench(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
-        self.parent.title = _("TavrWorkbench")  # TODO: make this more human readable by adding spaces
-        # TODO: set categories (folders where the module shows up in the module selector)
+        self.parent.title = _("TavrWorkbench")
         self.parent.categories = [translate("qSlicerAbstractCoreModule", "Examples")]
-        self.parent.dependencies = []  # TODO: add here list of module names that this module requires
-        self.parent.contributors = ["Mohammed Khubaib (Saeed Lab: Florida International University)"]  # TODO: replace with "Firstname Lastname (Organization)"
-        # TODO: update with short description of the module and a link to online module documentation
-        # _() function marks text as translatable to other languages
+        self.parent.dependencies = []
+        self.parent.contributors = ["Mohammed Khubaib (Saeed Lab: Florida International University)"]
         self.parent.helpText = _("""
         A 3D Slicer extension for fast, structured review of TAVR CT segmentations and measurements.
         See more information in <a href="https://github.com/organization/projectname#TavrWorkbench">module documentation</a>.
         """)
-        # TODO: replace with organization, grant and thanks
         self.parent.acknowledgementText = _("""
         This 3D Slicer module was developed by <a href="https://github.com/Mohammed-Khubaib">Mohammed Khubaib</a>, M.S. Computer Engineering, Florida International University, as part of the <a href="https://pcdslab.github.io/">Saeed Lab</a> under the supervision of <a href="https://pcdslab.github.io/team/Fahad-Saeed">Dr. Fahad Saeed</a> and <a href="https://www.cis.fiu.edu/faculty-staff/kaoutar-ben-ahmed/">Dr. Kaoutar Ben Ahmed</a>.""")
 
@@ -98,54 +138,34 @@ class TavrWorkbench(ScriptedLoadableModule):
 
 def registerSampleData():
     """Add data sets to Sample Data module."""
-    # It is always recommended to provide sample data for users to make it easy to try the module,
-    # but if no sample data is available then this method (and associated startupCompeted signal connection) can be removed.
-
     import SampleData
 
     iconsPath = os.path.join(os.path.dirname(__file__), "Resources/Icons")
 
-    # To ensure that the source code repository remains small (can be downloaded and installed quickly)
-    # it is recommended to store data sets that are larger than a few MB in a Github release.
-
     SampleData.SampleDataLogic.registerCustomSampleDataCategory("TavrWorkbench", title=_("TavrWorkbench"))
 
     # TODO: replace these placeholder sample data entries with real sample datasets for TavrWorkbench,
-    # or remove this function (and the startupCompleted connection above) entirely if no sample data
-    # is provided.
+    # or remove this function (and the startupCompleted connection above) entirely.
 
-    # TavrWorkbench1
     SampleData.SampleDataLogic.registerCustomSampleDataSource(
-        # Category and sample name displayed in Sample Data module
         category="TavrWorkbench",
         sampleName="TavrWorkbench1",
-        # Thumbnail should have size of approximately 260x280 pixels and stored in Resources/Icons folder.
-        # It can be created by Screen Capture module, "Capture all views" option enabled, "Number of images" set to "Single".
         thumbnailFileName=os.path.join(iconsPath, "TavrWorkbench1.png"),
-        # Download URL and target file name
         uris="https://github.com/Slicer/SlicerTestingData/releases/download/SHA256/998cb522173839c78657f4bc0ea907cea09fd04e44601f17c82ea27927937b95",
         fileNames="TavrWorkbench1.nrrd",
-        # Checksum to ensure file integrity. Can be computed by this command:
-        #  import hashlib; print(hashlib.sha256(open(filename, "rb").read()).hexdigest())
         checksums="SHA256:998cb522173839c78657f4bc0ea907cea09fd04e44601f17c82ea27927937b95",
-        # This node name will be used when the data set is loaded
         nodeNames="TavrWorkbench1",
     )
 
-    # TavrWorkbench2
     SampleData.SampleDataLogic.registerCustomSampleDataSource(
-        # Category and sample name displayed in Sample Data module
         category="TavrWorkbench",
         sampleName="TavrWorkbench2",
         thumbnailFileName=os.path.join(iconsPath, "TavrWorkbench2.png"),
-        # Download URL and target file name
         uris="https://github.com/Slicer/SlicerTestingData/releases/download/SHA256/1a64f3f422eb3d1c9b093d1a18da354b13bcf307907c66317e2463ee530b7a97",
         fileNames="TavrWorkbench2.nrrd",
         checksums="SHA256:1a64f3f422eb3d1c9b093d1a18da354b13bcf307907c66317e2463ee530b7a97",
-        # This node name will be used when the data set is loaded
         nodeNames="TavrWorkbench2",
     )
-
 
 
 class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
@@ -155,87 +175,76 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.logic = None
         self._parameterNode = None
         self._updatingGUIFromParameterNode = False
+
+        # ---- Current-case nodes ----
         self.volume_node = None
         self.segmentation_node = None
-        self.nifti_files = []
-        self.segmentation_files = []
-        self.directory = None
-        self.current_index = 0
-        self.likert_scores = []
-        self.n_files = 0
-        self.seg_mask_status = []
-        self.with_mapper_flag = False
-        self.id_subs = []
-        self.id_subs_checked = []
-        self.unique_case_flag = False
-        self.finish_flag = False
         self.pointListNode = None
         self.window_level = None
         self.segment_visiblity_states = {}
-        self.json_mode = False
-        self.markup_paths_per_case = []
-        self.case_ids = []
         self.loaded_markup_nodes = []
-        self.json_manifest_dir = None
-        self.annulus_contour_node = None
-        self.contour_nodes_by_label = {}
-
-        # ---- Centerline model (surface.vtp / centerline.vtp) support ----
-        self.centerline_model_paths_per_case = []
         self.loaded_model_nodes = []
+        self.contour_nodes_by_label = {}
+        self.centerline_nodes_by_label = {}
+        self.centerline_points_world = {}
+        self.centerline_arclength = {}
 
-        # ---- New review state ----
+        # ---- Case list / progress tracking (data-map + output folder) ----
+        self.samples = []
+        self.current_index = -1
+        self.n_files = 0
+        self.status = {}              # case_id -> {"overall", "time", "mask_edited"}
+        self.mask_status = {}         # case_id -> 0..3 (see _numerical_status_to_str)
+        self._case_loaded = False
+        self._logger_handler = None
+
+        # ---- Review state ----
         self.overall_button_group = None
         self.seg_button_groups = {}
         self.meas_button_groups = {}
-        self.case_reviews = {}
+        self.case_reviews = {}        # in-memory cache, index -> review dict
         self.active_measurement_keys = []
-        
-        # Summary tracking
-        self.total_samples_in_dataset = 0
-        self.reviewed_count = 0
-        self.pending_count = 0
 
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
     def setup(self):
         import qSlicerSegmentationsModuleWidgetsPythonQt
         ScriptedLoadableModuleWidget.setup(self)
 
         uiWidget = slicer.util.loadUI(self.resourcePath('UI/TavrWorkbench.ui'))
 
+        # ---- Input section: data map + output folder + case selector ----
         inputCollapsibleButton = ctk.ctkCollapsibleButton()
         inputCollapsibleButton.text = "Input"
         self.layout.addWidget(inputCollapsibleButton)
-        inputLayout = qt.QVBoxLayout(inputCollapsibleButton)
+        form = qt.QFormLayout(inputCollapsibleButton)
 
-        modeLayout = qt.QHBoxLayout()
-        self.inputModeDirectory = qt.QRadioButton("Directory")
-        self.inputModeJson = qt.QRadioButton("JSON Manifest")
-        self.inputModeDirectory.setChecked(True)
-        modeLayout.addWidget(self.inputModeDirectory)
-        modeLayout.addWidget(self.inputModeJson)
-        modeLayout.addStretch(1)
-        inputLayout.addLayout(modeLayout)
+        self.mapEdit = ctk.ctkPathLineEdit()
+        self.mapEdit.filters = ctk.ctkPathLineEdit.Files
+        self.mapEdit.nameFilters = ["JSON files (*.json)"]
+        self.mapEdit.settingKey = "TavrWorkbench/mapFile"
+        self.mapEdit.setToolTip("Select the data-map .json (browse button on the right)")
+        form.addRow("Data map (.json):", self.mapEdit)
 
-        self.directoryInputWidget = qt.QWidget()
-        directoryFormLayout = qt.QFormLayout(self.directoryInputWidget)
-        self.atlasDirectoryButton = ctk.ctkDirectoryButton()
-        directoryFormLayout.addRow("Directory: ", self.atlasDirectoryButton)
-        inputLayout.addWidget(self.directoryInputWidget)
+        self.outEdit = ctk.ctkPathLineEdit()
+        self.outEdit.filters = ctk.ctkPathLineEdit.Dirs
+        self.outEdit.settingKey = "TavrWorkbench/outDir"
+        self.outEdit.setToolTip("Reviews, edited masks, annotations.csv and progress are saved here")
+        self.outEdit.connect("currentPathChanged(QString)", lambda _p: self.loadStatus())
+        form.addRow("Output folder:", self.outEdit)
 
-        self.jsonInputWidget = qt.QWidget()
-        jsonFormLayout = qt.QFormLayout(self.jsonInputWidget)
-        self.jsonManifestPathEdit = ctk.ctkPathLineEdit()
-        self.jsonManifestPathEdit.filters = ctk.ctkPathLineEdit.Files
-        self.jsonManifestPathEdit.nameFilters = ["JSON files (*.json)"]
-        jsonFormLayout.addRow("Manifest JSON: ", self.jsonManifestPathEdit)
-        inputLayout.addWidget(self.jsonInputWidget)
+        self.loadListButton = qt.QPushButton("Load case list")
+        self.loadListButton.connect("clicked()", self.loadList)
+        form.addRow(self.loadListButton)
 
-        self.directoryInputWidget.setVisible(True)
-        self.jsonInputWidget.setVisible(False)
+        self.caseCombo = qt.QComboBox()
+        self.caseCombo.connect("activated(int)", lambda i: self.loadCase(i))
+        form.addRow("Case:", self.caseCombo)
 
-        self.inputModeDirectory.toggled.connect(self.onInputModeDirectoryToggled)
-        self.inputModeJson.toggled.connect(self.onInputModeJsonToggled)
-        self.jsonManifestPathEdit.currentPathChanged.connect(self.onJsonManifestChanged)
+        self.nextUnreviewedButton = qt.QPushButton("Next unreviewed ⏭")
+        self.nextUnreviewedButton.connect("clicked()", self.nextUnreviewed)
+        form.addRow(self.nextUnreviewedButton)
 
         self.layout.addWidget(uiWidget)
         self.ui = slicer.util.childWidgetVariables(uiWidget)
@@ -250,7 +259,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.EndImportEvent, self.onSceneEndImport)
 
         # Button connections
-        self.atlasDirectoryButton.directoryChanged.connect(self.onAtlasDirectoryChanged)
         self.ui.save_and_next.connect('clicked(bool)', self.save_and_next_clicked)
         self.ui.previous_case.connect('clicked(bool)', self.previous_case_clicked)
         self.ui.skip_case.connect('clicked(bool)', self.skip_case_clicked)
@@ -258,20 +266,257 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.overwrite_mask.connect('clicked(bool)', self.overwrite_mask_clicked)
 
         self.overall_button_group = qt.QButtonGroup()
-        self.overall_button_group.addButton(self.ui.radio_acceptable, 0)
-        self.overall_button_group.addButton(self.ui.radio_minor, 1)
-        self.overall_button_group.addButton(self.ui.radio_not_acceptable, 2)
+        self.overall_button_group.addButton(self.ui.radio_accept, 0)
+        self.overall_button_group.addButton(self.ui.radio_flag, 1)
 
-        self.ui.radio_acceptable.toggled.connect(lambda checked: self._onOverallToggled(RATING_ACCEPTABLE, checked))
-        self.ui.radio_minor.toggled.connect(lambda checked: self._onOverallToggled(RATING_MINOR, checked))
-        self.ui.radio_not_acceptable.toggled.connect(lambda checked: self._onOverallToggled(RATING_NOT_ACCEPTABLE, checked))
+        self.ui.radio_accept.toggled.connect(lambda checked: self._onOverallToggled(RATING_ACCEPT, checked))
+        self.ui.radio_flag.toggled.connect(lambda checked: self._onOverallToggled(RATING_FLAG, checked))
+        self._setupOverallShortcuts()
 
         self._buildSegmentationReviewTable()
         self.ui.measReviewContainer.setVisible(False)
 
         self._createSegmentEditorWidget_()
         self._createMarkupWidget_()
+        self._updateSummary()
 
+    # ------------------------------------------------------------------
+    # Output-folder helpers
+    # ------------------------------------------------------------------
+    def outDir(self):
+        return str(self.outEdit.currentPath or "")
+
+    @staticmethod
+    def _safe_name(name):
+        safe = "".join(c for c in str(name) if c.isalnum() or c in ('_', '-', '.')).strip()
+        return safe or "unknown_case"
+
+    def caseId(self, idx=None):
+        idx = self.current_index if idx is None else idx
+        if idx is None or idx < 0 or idx >= len(self.samples):
+            return ""
+        return str(self.samples[idx].get("case_id", idx))
+
+    def caseDir(self, cid):
+        return os.path.join(self.outDir(), self._safe_name(cid))
+
+    def casePath(self, cid, filename):
+        return os.path.join(self.caseDir(cid), filename)
+
+    # ------------------------------------------------------------------
+    # Progress tracking (review_status.json in the output folder)
+    # ------------------------------------------------------------------
+    def loadStatus(self):
+        sp = os.path.join(self.outDir(), STATUS_FILE) if self.outDir() else ""
+        self.status = {}
+        if sp and os.path.exists(sp):
+            try:
+                with open(sp) as f:
+                    self.status = json.load(f)
+                for entry in self.status.values():
+                    entry["overall"] = normalize_rating(entry.get("overall", RATING_NONE))
+            except Exception as e:
+                print(f"[TavrWorkbench] WARNING: could not read {sp}: {e}")
+        if self.samples:
+            self.refreshCombo()
+        self._updateSummary()
+
+    def dumpStatus(self):
+        if not self.outDir():
+            return
+        os.makedirs(self.outDir(), exist_ok=True)
+        with open(os.path.join(self.outDir(), STATUS_FILE), "w") as f:
+            json.dump(self.status, f, indent=2)
+
+    def isReviewed(self, cid):
+        return bool(self.status.get(str(cid), {}).get("overall"))
+
+    def refreshCombo(self):
+        self.caseCombo.blockSignals(True)
+        self.caseCombo.clear()
+        for s in self.samples:
+            cid = str(s.get("case_id", ""))
+            mark = RATING_TO_MARK.get(self.status.get(cid, {}).get("overall", ""), "·")
+            self.caseCombo.addItem(f"{mark} {cid}")
+        if 0 <= self.current_index < self.caseCombo.count:
+            self.caseCombo.setCurrentIndex(self.current_index)
+        self.caseCombo.blockSignals(False)
+
+    def _updateSummary(self):
+        total = len(self.samples)
+        reviewed = sum(1 for s in self.samples if self.isReviewed(s.get("case_id", "")))
+        self.ui.summaryTotal.setText(f"Total Samples in Dataset: {total}")
+        self.ui.summaryReviewed.setText(f"Reviewed: {reviewed}")
+        self.ui.summaryPending.setText(f"Pending: {total - reviewed}")
+        if total and self.current_index >= 0:
+            self.ui.status_checked.setText(f"Case {self.current_index + 1} / {total}  ({reviewed} reviewed)")
+        else:
+            self.ui.status_checked.setText("No case list loaded")
+
+    # ------------------------------------------------------------------
+    # Case list loading (data-map JSON)
+    # ------------------------------------------------------------------
+    def _is_valid_extension(self, path):
+        return any(str(path).endswith(i) for i in [".nii", ".nii.gz", ".nrrd"])
+
+    def _collect_case_assets(self, sample):
+        """Return (markups, models) dicts of full_key -> path that exist on disk."""
+        case_markups, case_models = {}, {}
+        for group_key in MARKUP_GROUP_KEYS:
+            group = sample.get(group_key)
+            if not isinstance(group, dict):
+                continue
+            for name, path in group.items():
+                full_key = f"{group_key}.{name}"
+                if not isinstance(path, str) or not os.path.exists(path):
+                    continue
+                if path.endswith(MODEL_EXTENSIONS):
+                    case_models[full_key] = path
+                elif path.endswith(('.mrk.json', '.json')):
+                    case_markups[full_key] = path
+        return case_markups, case_models
+
+    def loadList(self):
+        mp = str(self.mapEdit.currentPath or "")
+        if not mp or not os.path.isfile(mp):
+            slicer.util.errorDisplay("Select the data-map .json file first.")
+            return
+        if not self.outDir():
+            slicer.util.warningDisplay("No output folder selected yet - choose one before saving.")
+        try:
+            with open(mp) as f:
+                data = json.load(f)
+        except Exception as e:
+            slicer.util.errorDisplay(f"Could not parse data-map JSON:\n{e}")
+            return
+
+        if isinstance(data, list):
+            samples = data
+        elif "samples" in data:
+            samples = data["samples"]
+        else:
+            samples = sum([data.get(k, []) for k in ("training", "validation", "testing")], [])
+
+        usable, skipped = [], 0
+        all_meas_keys = set()
+        for s in samples:
+            image = s.get("image", "")
+            if not (isinstance(image, str) and os.path.exists(image) and self._is_valid_extension(image)):
+                skipped += 1
+                continue
+            usable.append(s)
+            markups, _models = self._collect_case_assets(s)
+            all_meas_keys.update(markups.keys())
+
+        if not usable:
+            slicer.util.errorDisplay("No usable cases found in this data map "
+                                     "(every 'image' path is missing or has an unsupported extension).")
+            return
+        if skipped:
+            print(f"[TavrWorkbench] Skipped {skipped} sample(s) with missing/unsupported image path.")
+
+        self._clearCaseNodes()
+        self.samples = usable
+        self.n_files = len(usable)
+        self.current_index = -1
+        self._case_loaded = False
+        self.case_reviews = {}
+        self.mask_status = {}
+
+        ordered_keys = [k for k in MEASUREMENT_KEY_TO_LABEL if k in all_meas_keys]
+        for k in sorted(all_meas_keys):
+            if k not in ordered_keys:
+                ordered_keys.append(k)
+        self._buildMeasurementReviewTable(ordered_keys)
+
+        self._setupLogger(mp)
+        self.loadStatus()
+        self.refreshCombo()
+
+        # Resume at the first unreviewed case (or the first case if all are done)
+        start = 0
+        for i, s in enumerate(self.samples):
+            if not self.isReviewed(s.get("case_id", "")):
+                start = i
+                break
+        msg = f"Loaded {self.n_files} cases"
+        if skipped:
+            msg += f" ({skipped} skipped: missing/unsupported image)"
+        slicer.util.showStatusMessage(msg, 4000)
+        self.loadCase(start)
+
+    def _setupLogger(self, map_path):
+        logger = logging.getLogger('TavrWorkbench')
+        logger.setLevel(logging.DEBUG)
+        if self._logger_handler is not None:
+            logger.removeHandler(self._logger_handler)
+            self._logger_handler = None
+        log_dir = self.outDir() if self.outDir() and os.path.isdir(self.outDir()) else os.path.dirname(map_path)
+        try:
+            handler = logging.FileHandler(os.path.join(log_dir, 'tavr_workbench.log'))
+            handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
+            logger.addHandler(handler)
+            self._logger_handler = handler
+            logger.info(f'Loaded data map {map_path}')
+        except Exception as e:
+            print(f"[TavrWorkbench] WARNING: could not create log file: {e}")
+
+    # ------------------------------------------------------------------
+    # Navigation
+    # ------------------------------------------------------------------
+    def step(self, d):
+        if self.samples:
+            self.loadCase(max(0, min(len(self.samples) - 1, self.current_index + d)))
+
+    def nextUnreviewed(self):
+        n = len(self.samples)
+        if not n:
+            return
+        for k in range(1, n + 1):
+            j = (self.current_index + k) % n
+            if not self.isReviewed(self.samples[j].get("case_id", "")):
+                return self.loadCase(j)
+        slicer.util.infoDisplay("All cases have been reviewed.")
+
+    def previous_case_clicked(self):
+        if self.n_files == 0:
+            slicer.util.warningDisplay("No case is currently loaded.")
+            return
+        if self.current_index <= 0:
+            slicer.util.warningDisplay("Already at the first case.")
+            return
+        self.loadCase(self.current_index - 1)
+
+    def skip_case_clicked(self):
+        """Move on to the next case without saving the current review."""
+        if self.n_files == 0:
+            slicer.util.warningDisplay("No case is currently loaded.")
+            return
+        if self.current_index >= self.n_files - 1:
+            slicer.util.warningDisplay("Already at the last case.")
+            return
+        self.loadCase(self.current_index + 1)
+
+    def clear_overall_clicked(self):
+        """Clear all radio buttons: Overall, Segmentation, and Measurement."""
+        self._resetReviewUI()
+
+    def loadCase(self, idx):
+        if not self.samples:
+            return
+        idx = max(0, min(len(self.samples) - 1, int(idx)))
+        if self._case_loaded and 0 <= self.current_index < len(self.samples):
+            self._saveCurrentReview()   # keep in-memory so Prev/Next doesn't lose ratings
+        self.current_index = idx
+        self._loadCaseData()
+        self._case_loaded = True
+        self._restoreReview(idx)
+        self.refreshCombo()
+        self._updateSummary()
+
+    # ------------------------------------------------------------------
+    # Review tables
+    # ------------------------------------------------------------------
     def _buildSegmentationReviewTable(self):
         container = self.ui.segReviewContainer
         layout = qt.QVBoxLayout(container)
@@ -282,14 +527,13 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         grid.addWidget(qt.QLabel("<b>Label</b>"), 0, 0)
         grid.addWidget(qt.QLabel("<b>✓</b>"), 0, 1, qt.Qt.AlignCenter)
-        grid.addWidget(qt.QLabel("<b>△</b>"), 0, 2, qt.Qt.AlignCenter)
-        grid.addWidget(qt.QLabel("<b>✕</b>"), 0, 3, qt.Qt.AlignCenter)
+        grid.addWidget(qt.QLabel("<b>⚑</b>"), 0, 2, qt.Qt.AlignCenter)
 
         for row_idx, label in enumerate(SEGMENTATION_LABELS, start=1):
             grid.addWidget(qt.QLabel(label), row_idx, 0)
 
             bg = qt.QButtonGroup()
-            for col_idx, rating in enumerate([RATING_ACCEPTABLE, RATING_MINOR, RATING_NOT_ACCEPTABLE], start=1):
+            for col_idx, rating in enumerate([RATING_ACCEPT, RATING_FLAG], start=1):
                 rb = qt.QRadioButton()
                 bg.addButton(rb, col_idx)
                 grid.addWidget(rb, row_idx, col_idx, qt.Qt.AlignCenter)
@@ -318,6 +562,7 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         if not measurement_keys:
             container.setVisible(False)
+            self.active_measurement_keys = []
             return
 
         container.setVisible(True)
@@ -329,15 +574,14 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         grid.addWidget(qt.QLabel("<b>Measurement</b>"), 0, 0)
         grid.addWidget(qt.QLabel("<b>✓</b>"), 0, 1, qt.Qt.AlignCenter)
-        grid.addWidget(qt.QLabel("<b>△</b>"), 0, 2, qt.Qt.AlignCenter)
-        grid.addWidget(qt.QLabel("<b>✕</b>"), 0, 3, qt.Qt.AlignCenter)
+        grid.addWidget(qt.QLabel("<b>⚑</b>"), 0, 2, qt.Qt.AlignCenter)
 
         for row_idx, key in enumerate(measurement_keys, start=1):
             display = MEASUREMENT_KEY_TO_LABEL.get(key, key)
             grid.addWidget(qt.QLabel(display), row_idx, 0)
 
             bg = qt.QButtonGroup()
-            for col_idx, rating in enumerate([RATING_ACCEPTABLE, RATING_MINOR, RATING_NOT_ACCEPTABLE], start=1):
+            for col_idx, rating in enumerate([RATING_ACCEPT, RATING_FLAG], start=1):
                 rb = qt.QRadioButton()
                 bg.addButton(rb, col_idx)
                 grid.addWidget(rb, row_idx, col_idx, qt.Qt.AlignCenter)
@@ -346,88 +590,71 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         layout.addWidget(groupBox)
         self.active_measurement_keys = measurement_keys
 
+    def _setupOverallShortcuts(self):
+        """Window-level shortcuts so the decision can be made while focus is in a slice/3D view."""
+        self.ui.radio_accept.setText(f"✓ Approve ({SHORTCUT_ACCEPT})")
+        self.ui.radio_flag.setText(f"⚑ Flag for review ({SHORTCUT_FLAG})")
+        self._shortcuts = []
+        for key, rating in ((SHORTCUT_ACCEPT, RATING_ACCEPT), (SHORTCUT_FLAG, RATING_FLAG)):
+            sc = qt.QShortcut(qt.QKeySequence(key), slicer.util.mainWindow())
+            sc.setContext(qt.Qt.WindowShortcut)
+            sc.connect("activated()", lambda r=rating: self._onOverallShortcut(r))
+            self._shortcuts.append(sc)
+
+    def _onOverallShortcut(self, rating):
+        # Only act while this module is the active one and a case is loaded
+        if not self.parent.isEntered or self.current_index < 0:
+            return
+        button = self.ui.radio_accept if rating == RATING_ACCEPT else self.ui.radio_flag
+        button.setChecked(True)
+
     def _onOverallToggled(self, rating, checked):
+        """Applying the overall decision sets every segmentation and measurement row to the same
+        value (Approve -> all approved, Flag -> all flagged); rows can then be adjusted individually."""
         if not checked:
             return
-        
-        for label, bg in self.seg_button_groups.items():
-            if rating == RATING_ACCEPTABLE:
-                bg.button(1).setChecked(True)
-            elif rating == RATING_MINOR:
-                bg.button(2).setChecked(True)
-            elif rating == RATING_NOT_ACCEPTABLE:
-                bg.button(3).setChecked(True)
-                
-        for display, bg in self.meas_button_groups.items():
-            if rating == RATING_ACCEPTABLE:
-                bg.button(1).setChecked(True)
-            elif rating == RATING_MINOR:
-                bg.button(2).setChecked(True)
-            elif rating == RATING_NOT_ACCEPTABLE:
-                bg.button(3).setChecked(True)
+        btn_id = {RATING_ACCEPT: 1, RATING_FLAG: 2}[rating]
+        for bg in self.seg_button_groups.values():
+            bg.button(btn_id).setChecked(True)
+        for bg in self.meas_button_groups.values():
+            bg.button(btn_id).setChecked(True)
+
+    def _uncheckGroup(self, bg):
+        bg.setExclusive(False)
+        for btn in bg.buttons():
+            btn.setChecked(False)
+        bg.setExclusive(True)
 
     def _resetReviewUI(self):
         if self.overall_button_group:
-            self.overall_button_group.setExclusive(False)
-            btn = self.overall_button_group.checkedButton()
-            if btn:
-                btn.setChecked(False)
-            self.overall_button_group.setExclusive(True)
-        
+            self._uncheckGroup(self.overall_button_group)
         for bg in self.seg_button_groups.values():
-            bg.setExclusive(False)
-            btn = bg.checkedButton()
-            if btn:
-                btn.setChecked(False)
-            bg.setExclusive(True)
-        
+            self._uncheckGroup(bg)
         for bg in self.meas_button_groups.values():
-            bg.setExclusive(False)
-            btn = bg.checkedButton()
-            if btn:
-                btn.setChecked(False)
-            bg.setExclusive(True)
-        
+            self._uncheckGroup(bg)
         self.ui.comment.setPlainText("")
 
     def _getOverallRating(self):
-        if self.ui.radio_acceptable.isChecked():
-            return RATING_ACCEPTABLE
-        if self.ui.radio_minor.isChecked():
-            return RATING_MINOR
-        if self.ui.radio_not_acceptable.isChecked():
-            return RATING_NOT_ACCEPTABLE
+        if self.ui.radio_accept.isChecked():
+            return RATING_ACCEPT
+        if self.ui.radio_flag.isChecked():
+            return RATING_FLAG
         return RATING_NONE
 
+    @staticmethod
+    def _ratings_from_groups(groups):
+        mapping = {1: RATING_ACCEPT, 2: RATING_FLAG}
+        return {name: mapping.get(bg.checkedId(), RATING_NONE) for name, bg in groups.items()}
+
     def _getSegRatings(self):
-        result = {}
-        for label, bg in self.seg_button_groups.items():
-            checked_id = bg.checkedId()
-            if checked_id == 1:
-                result[label] = RATING_ACCEPTABLE
-            elif checked_id == 2:
-                result[label] = RATING_MINOR
-            elif checked_id == 3:
-                result[label] = RATING_NOT_ACCEPTABLE
-            else:
-                result[label] = RATING_NONE
-        return result
+        return self._ratings_from_groups(self.seg_button_groups)
 
     def _getMeasRatings(self):
-        result = {}
-        for display, bg in self.meas_button_groups.items():
-            checked_id = bg.checkedId()
-            if checked_id == 1:
-                result[display] = RATING_ACCEPTABLE
-            elif checked_id == 2:
-                result[display] = RATING_MINOR
-            elif checked_id == 3:
-                result[display] = RATING_NOT_ACCEPTABLE
-            else:
-                result[display] = RATING_NONE
-        return result
+        return self._ratings_from_groups(self.meas_button_groups)
 
     def _saveCurrentReview(self):
+        if self.current_index < 0:
+            return
         self.case_reviews[self.current_index] = {
             "overall": self._getOverallRating(),
             "segmentation": self._getSegRatings(),
@@ -435,355 +662,163 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             "comment": self.ui.comment.toPlainText(),
         }
 
+    def _readReviewFromDisk(self, cid):
+        if not self.outDir():
+            return None
+        path = self.casePath(cid, CASE_REVIEW_FILE)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                return normalize_review(json.load(f).get("review"))
+        except Exception as e:
+            print(f"[TavrWorkbench] WARNING: could not read saved review {path}: {e}")
+            return None
+
     def _restoreReview(self, index):
         review = self.case_reviews.get(index)
         if review is None:
-            self._resetReviewUI()
+            review = self._readReviewFromDisk(self.caseId(index))
+            if review is not None:
+                self.case_reviews[index] = review
+        self._resetReviewUI()
+        if review is None:
             return
-        
-        has_data = False
-        if review.get("overall", RATING_NONE) != RATING_NONE:
-            has_data = True
-        if any(v != RATING_NONE for v in review.get("segmentation", {}).values()):
-            has_data = True
-        if any(v != RATING_NONE for v in review.get("measurements", {}).values()):
-            has_data = True
-        
-        if not has_data:
-            self._resetReviewUI()
-            return
-        
+
+        mapping = {RATING_ACCEPT: 1, RATING_FLAG: 2}
         ov = review.get("overall", RATING_NONE)
-        self.ui.radio_acceptable.setChecked(ov == RATING_ACCEPTABLE)
-        self.ui.radio_minor.setChecked(ov == RATING_MINOR)
-        self.ui.radio_not_acceptable.setChecked(ov == RATING_NOT_ACCEPTABLE)
-        
-        seg = review.get("segmentation", {})
-        for label, bg in self.seg_button_groups.items():
-            val = seg.get(label, RATING_NONE)
-            bg.setExclusive(False)
-            for btn in bg.buttons():
-                btn.setChecked(False)
-            if val == RATING_ACCEPTABLE:
-                bg.button(1).setChecked(True)
-            elif val == RATING_MINOR:
-                bg.button(2).setChecked(True)
-            elif val == RATING_NOT_ACCEPTABLE:
-                bg.button(3).setChecked(True)
-            bg.setExclusive(True)
-        
-        meas = review.get("measurements", {})
-        for display, bg in self.meas_button_groups.items():
-            val = meas.get(display, RATING_NONE)
-            bg.setExclusive(False)
-            for btn in bg.buttons():
-                btn.setChecked(False)
-            if val == RATING_ACCEPTABLE:
-                bg.button(1).setChecked(True)
-            elif val == RATING_MINOR:
-                bg.button(2).setChecked(True)
-            elif val == RATING_NOT_ACCEPTABLE:
-                bg.button(3).setChecked(True)
-            bg.setExclusive(True)
-        
+        self.ui.radio_accept.setChecked(ov == RATING_ACCEPT)
+        self.ui.radio_flag.setChecked(ov == RATING_FLAG)
+
+        # Overall toggling auto-fills all rows; per-row values restored below override that.
+        for stored, groups in ((review.get("segmentation", {}), self.seg_button_groups),
+                               (review.get("measurements", {}), self.meas_button_groups)):
+            for name, bg in groups.items():
+                self._uncheckGroup(bg)
+                btn_id = mapping.get(stored.get(name, RATING_NONE))
+                if btn_id:
+                    bg.button(btn_id).setChecked(True)
         self.ui.comment.setPlainText(review.get("comment", ""))
 
-    def _loadReviewsFromCSV(self):
-        csv_path = self.joinpath(self.directory, "annotations.csv")
-        if not os.path.exists(csv_path):
-            return
-        
-        try:
-            df = pd.read_csv(csv_path)
-            
-            file_to_index = {}
-            for idx, file_path in enumerate(self.nifti_files):
-                file_to_index[file_path] = idx
-            
-            for _, row in df.iterrows():
-                file_path = row.get('file', '')
-                if file_path in file_to_index:
-                    idx = file_to_index[file_path]
-                    review = {
-                        "overall": RATING_NONE,
-                        "segmentation": {},
-                        "measurements": {},
-                        "comment": row.get('comment', '')
-                    }
-                    
-                    for label in SEGMENTATION_LABELS:
-                        if label in row:
-                            rating_str = row[label]
-                            if rating_str == "✓ Acceptable":
-                                review["segmentation"][label] = RATING_ACCEPTABLE
-                            elif rating_str == "△ Minor correction":
-                                review["segmentation"][label] = RATING_MINOR
-                            elif rating_str == "✕ Not acceptable":
-                                review["segmentation"][label] = RATING_NOT_ACCEPTABLE
-                    
-                    for meas in ALL_MEASUREMENT_COLUMNS:
-                        if meas in row:
-                            rating_str = row[meas]
-                            if rating_str == "✓ Acceptable":
-                                review["measurements"][meas] = RATING_ACCEPTABLE
-                            elif rating_str == "△ Minor correction":
-                                review["measurements"][meas] = RATING_MINOR
-                            elif rating_str == "✕ Not acceptable":
-                                review["measurements"][meas] = RATING_NOT_ACCEPTABLE
-                    
-                    self.case_reviews[idx] = review
-        except Exception as e:
-            print(f"[TavrWorkbench] WARNING: Could not load reviews from CSV: {e}")
-
-    def _updateSummary(self):
-        self.ui.summaryTotal.setText(f"Total Samples in Dataset: {self.total_samples_in_dataset}")
-        self.ui.summaryReviewed.setText(f"Reviewed: {self.reviewed_count}")
-        self.ui.summaryPending.setText(f"Pending: {self.pending_count}")
-
-    def _rating_to_str(self, rating):
-        return {
-            RATING_ACCEPTABLE: "✓ Acceptable",
-            RATING_MINOR: "△ Minor correction",
-            RATING_NOT_ACCEPTABLE: "✕ Not acceptable",
-            RATING_NONE: "",
-        }.get(rating, "")
-
+    # ------------------------------------------------------------------
+    # Saving a review (per-case folder + CSV upsert + status JSON)
+    # ------------------------------------------------------------------
     def _numerical_status_to_str(self, status):
         return {0: "No mask found", 1: "Cannot load mask", 2: "Mask loaded, no edits", 3: "Mask edited"}.get(status, "Unknown")
 
-    def previous_case_clicked(self):
-        if self.n_files == 0:
-            slicer.util.warningDisplay("No case is currently loaded.")
-            return
-        if self.current_index <= 0:
-            slicer.util.warningDisplay("Already at the first case.")
-            return
+    def _writeCsv(self, cid, review):
+        path = os.path.join(self.outDir(), CSV_FILE)
+        cols = (["case_id", "file", "comment", "mask_path", "mask_status", "overall"]
+                + SEGMENTATION_LABELS + ALL_MEASUREMENT_COLUMNS + ["saved_at"])
+        rows = {}
+        if os.path.exists(path):
+            try:
+                with open(path, newline="") as f:
+                    for r in csv.DictReader(f):
+                        rows[r.get("case_id", "")] = r
+            except Exception as e:
+                print(f"[TavrWorkbench] WARNING: could not read existing CSV: {e}")
+
+        sample = self.samples[self.current_index]
+        mask_path = self.casePath(cid, CASE_MASK_FILE) if self.status.get(cid, {}).get("mask_edited") \
+            else (sample.get("label") or "")
+        row = {
+            "case_id": cid,
+            "file": sample.get("image", ""),
+            "comment": review.get("comment", ""),
+            "mask_path": mask_path,
+            "mask_status": self._numerical_status_to_str(self.mask_status.get(cid, 0)),
+            "overall": RATING_TO_STR.get(review.get("overall", RATING_NONE), ""),
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        for label in SEGMENTATION_LABELS:
+            row[label] = RATING_TO_STR.get(review.get("segmentation", {}).get(label, RATING_NONE), "")
+        for meas in ALL_MEASUREMENT_COLUMNS:
+            row[meas] = RATING_TO_STR.get(review.get("measurements", {}).get(meas, RATING_NONE), "")
+        rows[cid] = row
+
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows.values())
+
+    def saveReview(self):
+        """Persist the current case's review. Returns True on success."""
+        if not self.samples or self.current_index < 0:
+            return False
+        if not self.outDir():
+            slicer.util.errorDisplay("Select an output folder first.")
+            return False
+        if self._getOverallRating() == RATING_NONE:
+            slicer.util.warningDisplay("Please choose Approve or Flag for review before saving.")
+            return False
 
         self._saveCurrentReview()
-        self.current_index -= 1
-        self.finish_flag = False
+        cid = self.caseId()
+        review = self.case_reviews[self.current_index]
+        now = datetime.now().isoformat(timespec="seconds")
+        try:
+            os.makedirs(self.caseDir(cid), exist_ok=True)
+            with open(self.casePath(cid, CASE_REVIEW_FILE), "w") as f:
+                json.dump({"case_id": cid, "saved_at": now, "review": review}, f, indent=2)
 
-        if self.json_mode:
-            self.load_json_case()
-        else:
-            self.load_nifti_file(self.unique_case_flag)
+            entry = self.status.setdefault(cid, {})
+            entry["overall"] = review["overall"]
+            entry["time"] = now
+            self._writeCsv(cid, review)
+            self.dumpStatus()
+        except Exception as e:
+            slicer.util.errorDisplay(f"Could not save review for case {cid}:\n{e}")
+            return False
 
-        self._restoreReview(self.current_index)
-        self.ui.status_checked.setText("Checked: " + str(self.current_index + 1) + " / " + str(self.n_files))
-
-    def clear_overall_clicked(self):
-        """Clear all radio buttons: Overall, Segmentation, and Measurement."""
-        self._resetReviewUI()
-
-    def skip_case_clicked(self):
-        """Skip the current case without saving anything and move to the next case."""
-        if self.n_files == 0:
-            slicer.util.warningDisplay("No case is currently loaded.")
-            return
-        
-        if self.current_index >= self.n_files - 1:
-            slicer.util.warningDisplay("Already at the last case.")
-            return
-        
-        if self.json_mode:
-            nodes_to_remove = set()
-            for node in [self.volume_node, self.segmentation_node, self.pointListNode,
-                        self.segmentEditorWidget.segmentationNode()] + self.loaded_markup_nodes + self.loaded_model_nodes:
-                if node:
-                    nodes_to_remove.add(node)
-            for node in nodes_to_remove:
-                try:
-                    slicer.mrmlScene.RemoveNode(node)
-                except Exception as e:
-                    print(f"[TavrWorkbench] WARNING: failed removing node: {e}")
-            self.loaded_markup_nodes = []
-            self.loaded_model_nodes = []
-            self.volume_node = None
-            self.segmentation_node = None
-            self.pointListNode = None
-            self.annulus_contour_node = None
-            self.contour_nodes_by_label = {}
-            self.centerline_nodes_by_label = {}
-            self.centerline_points_world = {}
-            self.centerline_arclength = {}
-            
-            self.current_index += 1
-            self._resetReviewUI()
-            self.load_json_case()
-            self.ui.status_checked.setText("Checked: " + str(self.current_index + 1) + " / " + str(self.n_files))
-        else:
-            if self.volume_node:
-                self.store_current_window_level_settings()
-                slicer.mrmlScene.RemoveNode(self.volume_node)
-            if self.segmentation_node:
-                self.store_segment_visiblity_states()
-                slicer.mrmlScene.RemoveNode(self.segmentation_node)
-                if self.pointListNode:
-                    slicer.mrmlScene.RemoveNode(self.pointListNode)
-            
-            self.current_index += 1
-            self._resetReviewUI()
-            self.load_nifti_file()
-            self.ui.status_checked.setText("Checked: " + str(self.current_index + 1) + " / " + str(self.n_files))
-
-    def _build_csv_row_and_save(self, file_path_display, mask_path_display):
-        row_data = {
-            'file': file_path_display,
-            'comment': self.ui.comment.toPlainText(),
-            'mask_path': mask_path_display,
-            'mask_status': self._numerical_status_to_str(self.seg_mask_status[self.current_index])
-        }
-        
-        seg_ratings = self._getSegRatings()
-        for label in SEGMENTATION_LABELS:
-            row_data[label] = self._rating_to_str(seg_ratings.get(label, RATING_NONE))
-            
-        meas_ratings = self._getMeasRatings()
-        for meas in ALL_MEASUREMENT_COLUMNS:
-            row_data[meas] = self._rating_to_str(meas_ratings.get(meas, RATING_NONE))
-            
-        csv_columns = ['file', 'comment', 'mask_path', 'mask_status'] + SEGMENTATION_LABELS + ALL_MEASUREMENT_COLUMNS
-        df = pd.DataFrame([row_data], columns=csv_columns)
-        
-        csv_path = self.joinpath(self.directory, "annotations.csv")
-        write_header = not os.path.exists(csv_path)
-        df.to_csv(csv_path, mode='a', index=False, header=write_header)
+        slicer.util.showStatusMessage(f"Saved review for case {cid}", 3000)
+        self.refreshCombo()
+        self._updateSummary()
+        return True
 
     def save_and_next_clicked(self):
-        if self.json_mode:
-            self.save_and_next_json_clicked()
-            return
-        if self.n_files == 0 or self.current_index >= self.n_files:
+        if self.n_files == 0 or self.current_index < 0:
             slicer.util.warningDisplay("No case is currently loaded.")
             return
-
-        overall = self._getOverallRating()
-        if overall == RATING_NONE:
-            slicer.util.warningDisplay("Please select an overall rating before saving.")
+        if not self.saveReview():
             return
-
-        self._saveCurrentReview()
-
-        if not self.finish_flag and self.current_index < len(self.nifti_files):
-            head, tail = os.path.split(self.nifti_files[self.current_index])
-            file_display = self.nifti_files[self.current_index].replace(head, "").replace("/", "").replace("\\", "")
-            mask_display = self.segmentation_files[self.current_index].replace(head, "").replace("/", "").replace("\\", "")
-            
-            self._build_csv_row_and_save(file_display, mask_display)
-            self._saveDetailedReviewJson()
-            
-            self.reviewed_count += 1
-            self.pending_count -= 1
-            self._updateSummary()
-
-        ret = 0
-        if self.current_index <= self.n_files:
-            if self.volume_node:
-                self.store_current_window_level_settings()
-                slicer.mrmlScene.RemoveNode(self.volume_node)
-            if self.segmentation_node:
-                self.store_segment_visiblity_states()
-                slicer.mrmlScene.RemoveNode(self.segmentation_node)
-                if self.pointListNode:
-                    slicer.mrmlScene.RemoveNode(self.pointListNode)
-            if self.unique_case_flag:
-                while ret == 0 and self.current_index <= self.n_files:
-                    self.current_index += 1
-                    ret = self.load_nifti_file(unique=True)
-                    if self.current_index == self.n_files:
-                        self.finish_flag = True
-                        break
-            else:
-                self.current_index += 1
-                self.load_nifti_file()
-            self._resetReviewUI()
-            self._restoreReview(self.current_index)
-            self.ui.status_checked.setText("Checked: " + str(self.current_index + 1) + " / " + str(self.n_files))
-        else:
-            self.finish_flag = True
-
-    def save_and_next_json_clicked(self):
-        if self.n_files == 0 or self.current_index >= self.n_files:
-            slicer.util.warningDisplay("No case is currently loaded.")
-            return
-
-        overall = self._getOverallRating()
-        if overall == RATING_NONE:
-            slicer.util.warningDisplay("Please select an overall rating before saving.")
-            return
-
-        self._saveCurrentReview()
-
-        if not self.finish_flag and self.current_index < self.n_files:
-            file_display = self.nifti_files[self.current_index]
-            mask_display = self.segmentation_files[self.current_index]
-            
-            self._build_csv_row_and_save(file_display, mask_display)
-            self._saveDetailedReviewJson()
-            
-            self.reviewed_count += 1
-            self.pending_count -= 1
-            self._updateSummary()
-
-        self.current_index += 1
-        self._resetReviewUI()
-
-        if self.current_index >= self.n_files:
-            self.finish_flag = True
-            self.ui.status_checked.setText("Checked: " + str(self.n_files) + " / " + str(self.n_files))
+        if self.current_index + 1 < self.n_files:
+            self.loadCase(self.current_index + 1)
+        elif all(self.isReviewed(s.get("case_id", "")) for s in self.samples):
             slicer.util.infoDisplay("All cases have been reviewed.", "Finished")
-            nodes_to_remove = set()
-            for node in [self.volume_node, self.segmentation_node, self.pointListNode,
-                         self.segmentEditorWidget.segmentationNode()] + self.loaded_markup_nodes + self.loaded_model_nodes:
-                if node:
-                    nodes_to_remove.add(node)
-            for node in nodes_to_remove:
-                slicer.mrmlScene.RemoveNode(node)
-            self.loaded_markup_nodes = []
-            self.loaded_model_nodes = []
-            self.contour_nodes_by_label = {}
-            self.centerline_nodes_by_label = {}
-            self.centerline_points_world = {}
-            self.centerline_arclength = {}
-            self._refreshCenterlineTargets()
+        else:
+            self.nextUnreviewed()
+
+    def overwrite_mask_clicked(self):
+        """Save the (possibly edited) segmentation into <output>/<case_id>/segmentation.seg.nrrd.
+        The original label file is never touched; the edited copy is preferred when the case is re-opened."""
+        if not self.samples or self.current_index < 0:
+            slicer.util.warningDisplay("No case is currently loaded.")
+            return
+        if not self.outDir():
+            slicer.util.warningDisplay("No output folder is set.")
+            return
+        seg = self.segmentation_node or slicer.mrmlScene.GetFirstNodeByClass('vtkMRMLSegmentationNode')
+        if not seg:
+            slicer.util.warningDisplay("No segmentation node found to save.")
             return
 
-        self.load_json_case()
-        self._restoreReview(self.current_index)
-
-    def _saveDetailedReviewJson(self):
-        if not self.directory:
+        cid = self.caseId()
+        os.makedirs(self.caseDir(cid), exist_ok=True)
+        path = self.casePath(cid, CASE_MASK_FILE)
+        if not slicer.util.saveNode(seg, path):
+            slicer.util.errorDisplay(f"Could not save segmentation to:\n{path}")
             return
-        review_path = os.path.join(self.directory, "detailed_reviews.json")
-        all_reviews = {}
-        if os.path.exists(review_path):
-            try:
-                with open(review_path, 'r') as f:
-                    all_reviews = json.load(f)
-            except Exception:
-                all_reviews = {}
-        case_key = str(self.current_index)
-        if self.current_index < len(self.case_ids):
-            case_key = str(self.case_ids[self.current_index])
-        all_reviews[case_key] = self.case_reviews.get(self.current_index, {})
-        try:
-            with open(review_path, 'w') as f:
-                json.dump(all_reviews, f, indent=2)
-        except Exception as e:
-            print(f"[TavrWorkbench] WARNING: could not save detailed review JSON: {e}")
+        self.mask_status[cid] = 3
+        entry = self.status.setdefault(cid, {})
+        entry["mask_edited"] = True
+        entry["mask_saved_at"] = datetime.now().isoformat(timespec="seconds")
+        self.dumpStatus()
+        slicer.util.infoDisplay(f"Segmentation saved successfully as:\n{path}")
 
-    def onInputModeDirectoryToggled(self, checked):
-        if not checked:
-            return
-        self.directoryInputWidget.setVisible(True)
-        self.jsonInputWidget.setVisible(False)
-
-    def onInputModeJsonToggled(self, checked):
-        if not checked:
-            return
-        self.directoryInputWidget.setVisible(False)
-        self.jsonInputWidget.setVisible(True)
-
+    # ------------------------------------------------------------------
+    # View alignment
+    # ------------------------------------------------------------------
     def _createAlignmentWidget_(self):
         alignmentCollapsibleButton = ctk.ctkCollapsibleButton()
         alignmentCollapsibleButton.text = "View Alignment"
@@ -813,7 +848,7 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if contour_node is None:
             slicer.util.warningDisplay(
                 f"No loaded markup found for '{target}'.\n\n"
-                "Load a JSON case that contains this contour, or choose another target."
+                "Load a case that contains this contour, or choose another target."
             )
             return
         self.align_views_to_contour(contour_node, target)
@@ -822,12 +857,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # Centerline slicing (slider-driven CPR-style axial alignment)
     # ------------------------------------------------------------------
     def _createCenterlineSlicingWidget_(self):
-        """Build the 'Centerline Slicing' panel: a target combo box, an
-        enable checkbox, and a slider that moves a cutting plane along the
-        centerline while keeping that plane perpendicular to the local
-        centerline tangent (i.e. a true cross-section of the vessel), the
-        same way vessel/CPR analysis tools reformat along a path.
-        """
         centerlineCollapsibleButton = ctk.ctkCollapsibleButton()
         centerlineCollapsibleButton.text = "Centerline Slicing"
         self.layout.addWidget(centerlineCollapsibleButton)
@@ -867,9 +896,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.centerlineSliceSizeSpinBox.valueChanged.connect(self.onCenterlineSliceSizeChanged)
 
     def _centerline_tangent(self, points, index):
-        """Local tangent direction at points[index], via a central
-        difference against its neighbours so the plane stays smoothly
-        perpendicular to the centerline as the slider moves."""
         n = points.shape[0]
         if n < 2:
             return np.array([0.0, 0.0, 1.0])
@@ -884,10 +910,7 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         return tangent / norm
 
     def _compute_centerline_arrays(self, label, node):
-        """Extract a dense, ordered array of world-space points from a
-        centerline curve/markup node and the cumulative arc length along
-        it, caching both under `label` for slider use."""
-        points = self._get_markup_points_world(node)
+        points = self._get_markup_points_world(node) if node is not None else None
         if points is None or points.shape[0] < 2:
             self.centerline_points_world[label] = None
             self.centerline_arclength[label] = None
@@ -899,17 +922,13 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.centerline_arclength[label] = cumulative
 
     def _refreshCenterlineTargets(self):
-        """Rebuild the centerline combo box / slider range for whatever
-        centerline markups are loaded for the current case (called after
-        each case load, and cleared out for directory-mode / no-data
-        cases)."""
         if not hasattr(self, "centerlineTargetComboBox"):
             return
 
         self.centerlineTargetComboBox.blockSignals(True)
         self.centerlineTargetComboBox.clear()
 
-        labels = sorted(self.centerline_nodes_by_label.keys()) if hasattr(self, "centerline_nodes_by_label") else []
+        labels = sorted(self.centerline_nodes_by_label.keys())
         if not labels:
             self.centerlineTargetComboBox.addItem("No centerline loaded")
             self.centerlineTargetComboBox.setEnabled(False)
@@ -923,7 +942,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         preferred = "centerline.points"
         for label in labels:
-            self.centerline_nodes_by_label.setdefault(label, None)
             self._compute_centerline_arrays(label, self.centerline_nodes_by_label[label])
             self.centerlineTargetComboBox.addItem(label)
 
@@ -970,8 +988,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def onCenterlineEnableToggled(self, checked):
         if checked:
             self._applyCenterlineSlicePosition(self.centerlineSlider.value)
-        # Leaving it unchecked simply stops the slider from driving the
-        # Red view further; it does not revert prior slices.
 
     def onCenterlineSliceSizeChanged(self, _value=None):
         if self.centerlineEnableCheckBox.isChecked():
@@ -984,13 +1000,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._applyCenterlineSlicePosition(value)
 
     def _applyCenterlineSlicePosition(self, index):
-        """Move all three slice planes to centerline point `index`, all
-        pinned to the same point and built from the same tangent-aligned
-        frame, so the crosshair stays centered on the centerline and every
-        view stays perpendicular/tangential to it as the slider moves.
-        This mirrors align_views_to_contour's Red/Yellow/Green axis
-        assignment, just re-applied at each slider step instead of once
-        for a static contour plane."""
         label = self.centerlineTargetComboBox.currentText
         points = self.centerline_points_world.get(label)
         if points is None or points.shape[0] == 0:
@@ -1026,18 +1035,10 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         yellow_view = "Yellow" if "Yellow" in view_names else (view_names[1] if len(view_names) > 1 else None)
         green_view = "Green" if "Green" in view_names else (view_names[2] if len(view_names) > 2 else None)
 
-        # Red: cross-section perpendicular to the centerline tangent (same
-        # axis assignment as before).
         if red_view:
             self._set_slice_view_plane(red_view, x_axis, y_axis, z_axis, point, shared_fov)
         else:
             print("[Centerline] No Red-equivalent slice view found.")
-
-        # Yellow / Green: longitudinal views that contain the tangent
-        # direction, so they slide *along* the centerline instead of
-        # staying frozen in the default sagittal/coronal orientation -
-        # exactly the axis pattern align_views_to_contour uses for a
-        # static contour plane, just re-applied every slider step.
         if yellow_view:
             self._set_slice_view_plane(yellow_view, x_axis, z_axis, -y_axis, point, shared_fov)
         else:
@@ -1052,142 +1053,9 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         except Exception:
             pass
 
-    def onJsonManifestChanged(self, json_path):
-        if hasattr(self, "inputModeJson") and not self.inputModeJson.isChecked():
-            return
-        if not json_path or not os.path.exists(json_path):
-            return
-        logger = logging.getLogger('TavrWorkbench')
-        logger.setLevel(logging.DEBUG)
-        try:
-            with open(json_path, 'r') as f:
-                manifest = json.load(f)
-        except Exception as e:
-            print(f"[TavrWorkbench] ERROR: could not parse JSON manifest {json_path}: {e}")
-            slicer.util.errorDisplay(f"Could not parse JSON manifest:\n{e}")
-            return
-
-        self.json_mode = True
-        self.json_manifest_dir = os.path.dirname(json_path)
-        self.directory = self.json_manifest_dir
-        self.nifti_files = []
-        self.segmentation_files = []
-        self.seg_mask_status = []
-        self.markup_paths_per_case = []
-        self.centerline_model_paths_per_case = []
-        self.case_ids = []
-        self.current_index = 0
-        self.finish_flag = False
-        self.loaded_markup_nodes = []
-        self.loaded_model_nodes = []
-        self.annulus_contour_node = None
-        self.contour_nodes_by_label = {}
-        self.centerline_nodes_by_label = {}
-        self.centerline_points_world = {}
-        self.centerline_arclength = {}
-        self.case_reviews = {}
-
-        fileHandler = logging.FileHandler(os.path.join(self.json_manifest_dir, 'tavr_workbench.log'))
-        fileHandler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
-        logger.addHandler(fileHandler)
-
-        markup_group_keys = ["hinge_points", "contours", "max_diameters", "min_diameters", "heights", "centerline"]
-        # Sub-keys within a group that are 3D model geometry (.vtp) rather than
-        # point-based markups. These are loaded as models and are intentionally
-        # excluded from the Measurement Review table.
-        model_extensions = ('.vtp',)
-        all_meas_keys = set()
-
-        self.total_samples_in_dataset = len(manifest.get("samples", []))
-
-        for sample in manifest.get("samples", []):
-            image_path = sample.get("image", "")
-            label_path = sample.get("label", "")
-            case_id = sample.get("case_id", "")
-            if not (isinstance(image_path, str) and os.path.exists(image_path) and self._is_valid_extension(image_path)):
-                logger.info(f'Case {case_id}: image {image_path} missing or unsupported extension, skipping')
-                continue
-            self.nifti_files.append(image_path)
-            self.case_ids.append(case_id)
-            if isinstance(label_path, str) and os.path.exists(label_path) and self._is_valid_extension(label_path):
-                self.segmentation_files.append(label_path)
-                self.seg_mask_status.append(2)
-            else:
-                self.segmentation_files.append("")
-                self.seg_mask_status.append(0)
-                logger.info(f'Case {case_id}: no usable segmentation label found')
-
-            case_markups = {}
-            case_models = {}
-            for group_key in markup_group_keys:
-                group = sample.get(group_key)
-                if not isinstance(group, dict):
-                    continue
-                for name, path in group.items():
-                    full_key = f"{group_key}.{name}"
-                    if not isinstance(path, str):
-                        continue
-                    if path.endswith(model_extensions):
-                        # e.g. centerline.surface / centerline.curve (.vtp models)
-                        if os.path.exists(path):
-                            case_models[full_key] = path
-                        else:
-                            logger.info(f'Case {case_id}: model {full_key} missing at {path}')
-                    elif path.endswith(('.mrk.json', '.json')):
-                        if os.path.exists(path):
-                            case_markups[full_key] = path
-                            all_meas_keys.add(full_key)
-                        else:
-                            logger.info(f'Case {case_id}: markup {full_key} missing at {path}')
-            self.markup_paths_per_case.append(case_markups)
-            self.centerline_model_paths_per_case.append(case_models)
-
-        all_files_snapshot = list(self.nifti_files)
-        self.n_files = len(self.nifti_files)
-        print(f"[TavrWorkbench] Parsed manifest: {self.n_files} usable cases found "
-              f"(out of {self.total_samples_in_dataset} listed).")
-        if self.n_files == 0:
-            msg = ("No usable cases found in this manifest. Every 'image' path failed the "
-                   "os.path.exists()/extension check.")
-            print(f"[TavrWorkbench] ERROR: {msg}")
-            slicer.util.errorDisplay(msg)
-            return
-
-        if os.path.exists(self.joinpath(self.directory, "annotations.csv")):
-            ann_csv = pd.read_csv(self.joinpath(self.directory, "annotations.csv"))
-            self.reviewed_count = len(ann_csv)
-            self.nifti_files, self.segmentation_files, self.seg_mask_status, _, _ = self._restore_index(
-                ann_csv, self.nifti_files, self.segmentation_files, self.seg_mask_status)
-            kept_set = set(self.nifti_files)
-            filtered_ids, filtered_markups, filtered_models = [], [], []
-            for path, cid, mk, mdl in zip(all_files_snapshot, self.case_ids, self.markup_paths_per_case, self.centerline_model_paths_per_case):
-                if path in kept_set:
-                    filtered_ids.append(cid)
-                    filtered_markups.append(mk)
-                    filtered_models.append(mdl)
-            self.case_ids = filtered_ids
-            self.markup_paths_per_case = filtered_markups
-            self.centerline_model_paths_per_case = filtered_models
-            self.n_files = len(self.nifti_files)
-            
-            self._loadReviewsFromCSV()
-        else:
-            self.reviewed_count = 0
-        
-        self.pending_count = self.total_samples_in_dataset - self.reviewed_count
-
-        ordered_keys = [k for k in MEASUREMENT_KEY_TO_LABEL if k in all_meas_keys]
-        for k in sorted(all_meas_keys):
-            if k not in ordered_keys:
-                ordered_keys.append(k)
-        self._buildMeasurementReviewTable(ordered_keys)
-
-        self.ui.status_checked.setText("Checked: " + str(self.current_index + 1) + " / " + str(self.n_files))
-        self._updateSummary()
-        logger.info(f'Loaded {self.n_files} cases from JSON manifest {json_path}')
-        self.load_json_case()
-        self._restoreReview(self.current_index)
-
+    # ------------------------------------------------------------------
+    # Segmentation loading
+    # ------------------------------------------------------------------
     def _load_segmentation_flexible(self, path):
         try:
             segmentation_node = slicer.util.loadSegmentation(path)
@@ -1208,6 +1076,9 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             logging.getLogger('TavrWorkbench').info(f'Could not load segmentation from {path}: {e}')
             return None
 
+    # ------------------------------------------------------------------
+    # Markups widget helpers
+    # ------------------------------------------------------------------
     def _enableWidgetRecursively(self, widget):
         if not widget:
             return
@@ -1276,6 +1147,9 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             except Exception:
                 pass
 
+    # ------------------------------------------------------------------
+    # Geometry helpers
+    # ------------------------------------------------------------------
     def _get_markup_points_world(self, markup_node):
         points = []
         for methodName in ["GetCurvePointsWorld", "GetCurveWorld"]:
@@ -1417,14 +1291,12 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     try:
                         getattr(sliceNode, methodName)()
                         orientation_set = True
-                        print(f"[Alignment] {view_name}: orientation set using {methodName}()")
                         break
                     except Exception as e:
                         print(f"[Alignment] {view_name}: {methodName} failed: {e}")
             if not orientation_set:
                 try:
                     sliceNode.SetOrientation("Reformat")
-                    print(f"[Alignment] {view_name}: orientation set using SetOrientation('Reformat')")
                 except Exception as e:
                     print(f"[Alignment] {view_name}: SetOrientation('Reformat') failed: {e}")
             if hasattr(sliceNode, "SetSliceToRAS"):
@@ -1463,7 +1335,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 wasModified = sliceNode.StartModify()
                 try:
                     sliceNode.SetFieldOfView(float(required_fov[0]), float(required_fov[1]))
-                    print(f"[Alignment] {view_name}: set FOV to {required_fov[0]:.1f} x {required_fov[1]:.1f} mm")
                 except Exception as e:
                     print(f"[Alignment] {view_name}: SetFieldOfView failed: {e}")
                 finally:
@@ -1482,7 +1353,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             sliceWidget.forceRender()
         except Exception:
             pass
-        print(f"[Alignment] {view_name}: plane set.")
         return True
 
     def align_views_to_contour(self, curve_node, contour_label="contour"):
@@ -1493,37 +1363,28 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         print(f"[Alignment] Aligning views using contour: {contour_label} ({node_name})")
         points = self._get_markup_points_world(curve_node)
         if points.size == 0 or points.shape[0] < 3:
-            print("[Alignment] Not enough points extracted from contour.")
             slicer.util.warningDisplay(f"Not enough points were found in '{contour_label}' to define a plane.")
             return
         if not np.all(np.isfinite(points)):
-            print("[Alignment] Contour points contain non-finite values.")
             slicer.util.warningDisplay(f"Contour points for '{contour_label}' contain invalid coordinates.")
             return
         centroid = np.mean(points, axis=0)
         centered = points - centroid
         if np.linalg.norm(centered) < 1e-6:
-            print("[Alignment] Contour points are degenerate.")
             slicer.util.warningDisplay(f"Contour points for '{contour_label}' are degenerate.")
             return
         try:
             u, s, vh = np.linalg.svd(centered)
         except Exception as e:
-            print(f"[Alignment] SVD failed: {e}")
             slicer.util.warningDisplay(f"Plane fitting failed for '{contour_label}': {e}")
             return
         normal = vh[2].astype(float)
         if np.linalg.norm(normal) < 1e-9:
-            print("[Alignment] Could not compute contour plane normal.")
             slicer.util.warningDisplay(f"Could not compute a plane normal for '{contour_label}'.")
             return
         if normal[2] < 0:
             normal = -normal
         x_axis, y_axis, z_axis = self._orthogonal_axes_from_normal(normal)
-        print(f"[Alignment] Contour centroid: {centroid}")
-        print(f"[Alignment] Red X axis: {x_axis}")
-        print(f"[Alignment] Red Y axis: {y_axis}")
-        print(f"[Alignment] Red Z axis / contour plane normal: {z_axis}")
         layoutManager = slicer.app.layoutManager()
         if len(layoutManager.sliceViewNames()) < 3:
             try:
@@ -1531,7 +1392,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 if four_up is not None:
                     layoutManager.setLayout(four_up)
                     slicer.app.processEvents()
-                    print("[Alignment] Layout switched to Four-Up to expose Red/Yellow/Green views.")
             except Exception as e:
                 print(f"[Alignment] Could not switch layout to Four-Up: {e}")
         if self.volume_node:
@@ -1548,21 +1408,14 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         green_view = "Green" if "Green" in view_names else (view_names[2] if len(view_names) > 2 else None)
         if red_view:
             self._set_slice_view_plane(red_view, x_axis, y_axis, z_axis, centroid, shared_fov)
-        else:
-            print("[Alignment] No Red-equivalent slice view found.")
         if yellow_view:
             self._set_slice_view_plane(yellow_view, x_axis, z_axis, -y_axis, centroid, shared_fov)
-        else:
-            print("[Alignment] No Yellow-equivalent slice view found.")
         if green_view:
             self._set_slice_view_plane(green_view, y_axis, z_axis, x_axis, centroid, shared_fov)
-        else:
-            print("[Alignment] No Green-equivalent slice view found.")
         try:
             layoutManager.forceRender()
         except Exception:
             pass
-        print(f"[Alignment] Finished synchronized Red/Yellow/Green alignment using {contour_label}.")
 
     def align_views_to_annulus(self, curve_node):
         self.align_views_to_contour(curve_node, "contours.annulus")
@@ -1654,12 +1507,26 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             layoutManager.forceRender()
         except Exception:
             pass
-        print("[Alignment] Slice views reset to default Axial/Sagittal/Coronal orientations.")
 
-    def load_json_case(self):
+    # ------------------------------------------------------------------
+    # Case loading
+    # ------------------------------------------------------------------
+    def _clearCaseNodes(self):
+        """Remove every MRML node belonging to the currently loaded case."""
+        if self.volume_node:
+            self.store_current_window_level_settings()
+        if self.segmentation_node:
+            self.store_segment_visiblity_states()
+
         nodes_to_remove = set()
-        for node in [self.volume_node, self.segmentation_node, self.pointListNode,
-                      self.segmentEditorWidget.segmentationNode()] + self.loaded_markup_nodes + self.loaded_model_nodes:
+        candidates = [self.volume_node, self.segmentation_node, self.pointListNode]
+        if hasattr(self, "segmentEditorWidget") and self.segmentEditorWidget is not None:
+            try:
+                candidates.append(self.segmentEditorWidget.segmentationNode())
+            except Exception:
+                pass
+        candidates += self.loaded_markup_nodes + self.loaded_model_nodes
+        for node in candidates:
             if node:
                 nodes_to_remove.add(node)
         for node in nodes_to_remove:
@@ -1672,53 +1539,72 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.volume_node = None
         self.segmentation_node = None
         self.pointListNode = None
-        self.annulus_contour_node = None
         self.contour_nodes_by_label = {}
         self.centerline_nodes_by_label = {}
         self.centerline_points_world = {}
         self.centerline_arclength = {}
 
-        if self.current_index >= self.n_files:
-            self.finish_flag = True
-            return
+    def _loadCaseData(self):
+        self._clearCaseNodes()
+        sample = self.samples[self.current_index]
+        cid = self.caseId()
+        logger = logging.getLogger('TavrWorkbench')
 
-        case_label = self.case_ids[self.current_index] if self.current_index < len(self.case_ids) else self.current_index
-        image_path = self.nifti_files[self.current_index]
-        print(f"[TavrWorkbench] Loading case {case_label} ({self.current_index + 1}/{self.n_files}): {image_path}")
+        image_path = sample.get("image", "")
+        print(f"[TavrWorkbench] Loading case {cid} ({self.current_index + 1}/{self.n_files}): {image_path}")
+
+        # Prefer an edited mask saved in the output folder, otherwise the original label
+        label_path = sample.get("label", "") or ""
+        edited_mask = self.casePath(cid, CASE_MASK_FILE) if self.outDir() else ""
+        from_saved_mask = bool(edited_mask and os.path.exists(edited_mask))
+        if from_saved_mask:
+            label_path = edited_mask
+        if not (isinstance(label_path, str) and os.path.exists(label_path)
+                and (from_saved_mask or self._is_valid_extension(label_path))):
+            label_path = ""
+
+        case_markups, case_models = self._collect_case_assets(sample)
+
         slicer.app.layoutManager().setRenderPaused(True)
         try:
             try:
                 self.volume_node = slicer.util.loadVolume(image_path)
             except Exception as e:
                 print(f"[TavrWorkbench] ERROR loading volume {image_path}: {e}")
-                slicer.util.errorDisplay(f"Could not load volume for case {case_label}:\n{image_path}\n\n{e}")
+                slicer.util.errorDisplay(f"Could not load volume for case {cid}:\n{image_path}\n\n{e}")
                 self.volume_node = None
             if self.volume_node is None:
-                self.ui.status_checked.setText("Checked: " + str(self.current_index + 1) + " / " + str(self.n_files))
+                self._refreshCenterlineTargets()
                 return
             slicer.util.setSliceViewerLayers(background=self.volume_node)
             self.restore_window_level_settings()
-            label_path = self.segmentation_files[self.current_index]
+
             if label_path:
                 self.segmentation_node = self._load_segmentation_flexible(label_path)
                 if self.segmentation_node:
+                    self.mask_status[cid] = 3 if from_saved_mask else 2
                     self.restore_segment_visiblity_states()
                     try:
                         self.set_segmentation_and_mask_for_segmentation_editor()
                     except Exception as e:
                         print(f"[TavrWorkbench] WARNING: could not initialize segment editor for {label_path}: {e}")
                 else:
-                    print(f"[TavrWorkbench] WARNING: segmentation could not be loaded for case {case_label}: {label_path}")
-            for label, path in self.markup_paths_per_case[self.current_index].items():
+                    self.mask_status[cid] = 1
+                    print(f"[TavrWorkbench] WARNING: segmentation could not be loaded for case {cid}: {label_path}")
+            else:
+                self.mask_status[cid] = 1 if sample.get("label") else 0
+                logger.info(f'Case {cid}: no usable segmentation label found')
+
+            for label, path in case_markups.items():
                 try:
                     markupNode = slicer.util.loadMarkups(path)
                     if markupNode:
                         markupNode.SetName(label)
                         if not markupNode.GetDisplayNode():
                             markupNode.CreateDefaultDisplayNodes()
-                        markupNode.GetDisplayNode().SetVisibility(True)
                         displayNode = markupNode.GetDisplayNode()
-                        if displayNode and hasattr(displayNode, "SetSliceIntersectionVisibility"):
+                        displayNode.SetVisibility(True)
+                        if hasattr(displayNode, "SetSliceIntersectionVisibility"):
                             try:
                                 displayNode.SetSliceIntersectionVisibility(True)
                             except Exception:
@@ -1727,20 +1613,15 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                         lower_label = label.lower()
                         if lower_label in ["contours.annulus", "contours.sov", "contours.stj"]:
                             self.contour_nodes_by_label[lower_label] = markupNode
-                        point_count = "unknown"
-                        if hasattr(markupNode, "GetNumberOfControlPoints"):
-                            point_count = markupNode.GetNumberOfControlPoints()
-                        print(f"[TavrWorkbench] Loaded markup '{label}' with {point_count} points from {path}")
+                        if lower_label.startswith("centerline."):
+                            self.centerline_nodes_by_label[lower_label] = markupNode
                     else:
                         print(f"[TavrWorkbench] WARNING: loadMarkups returned None for {label}: {path}")
                 except Exception as e:
                     print(f"[TavrWorkbench] WARNING: could not load markup {label} from {path}: {e}")
 
-            # ---- Centerline models (surface.vtp / centerline.vtp) ----
-            # These are 3D model files, not point-based markups, so they are
-            # loaded with slicer.util.loadModel rather than loadMarkups, and
-            # they are never added to the Measurement Review table.
-            for label, path in self.centerline_model_paths_per_case[self.current_index].items():
+            # Centerline models (surface.vtp / centerline.vtp): loaded as models, not reviewed
+            for label, path in case_models.items():
                 try:
                     modelNode = slicer.util.loadModel(path)
                     if modelNode:
@@ -1752,11 +1633,9 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                             displayNode.SetVisibility(True)
                             lower_label = label.lower()
                             if lower_label.endswith("surface"):
-                                # Semi-transparent surface, easy to see through
                                 displayNode.SetColor(0.9, 0.85, 0.2)
                                 displayNode.SetOpacity(0.35)
                             elif lower_label.endswith("curve"):
-                                # Solid, brightly colored centerline curve
                                 displayNode.SetColor(1.0, 0.1, 0.1)
                                 if hasattr(displayNode, "SetLineWidth"):
                                     displayNode.SetLineWidth(3)
@@ -1766,7 +1645,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                                 except Exception:
                                     pass
                         self.loaded_model_nodes.append(modelNode)
-                        print(f"[TavrWorkbench] Loaded model '{label}' from {path}")
                     else:
                         print(f"[TavrWorkbench] WARNING: loadModel returned None for {label}: {path}")
                 except Exception as e:
@@ -1775,21 +1653,12 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             slicer.app.layoutManager().setRenderPaused(False)
             slicer.app.processEvents()
 
-        for node in self.loaded_markup_nodes:
-            name = node.GetName().lower() if node.GetName() else ""
-            if name in ["contours.annulus", "contours.sov", "contours.stj"] and name not in self.contour_nodes_by_label:
-                self.contour_nodes_by_label[name] = node
-            if name.startswith("centerline.") and name not in self.centerline_nodes_by_label:
-                self.centerline_nodes_by_label[name] = node
-
         layoutManager = slicer.app.layoutManager()
         for sliceViewName in layoutManager.sliceViewNames():
             try:
                 layoutManager.sliceWidget(sliceViewName).sliceLogic().FitSliceToAll()
             except Exception as e:
                 print(f"[TavrWorkbench] WARNING: FitSliceToAll failed for {sliceViewName}: {e}")
-        print(f"[TavrWorkbench] Available alignment targets: {list(self.contour_nodes_by_label.keys())}")
-        print(f"[TavrWorkbench] Available centerline targets: {list(self.centerline_nodes_by_label.keys())}")
 
         active_markup = None
         selected_alignment = ""
@@ -1813,15 +1682,12 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     slicer.modules.markups.logic().SetActiveListID(active_markup.GetID())
                 except Exception as e:
                     print(f"[TavrWorkbench] WARNING: could not set active markup node: {e}")
-        if hasattr(self, "_enableMarkupsWidgetOptions"):
-            self._enableMarkupsWidgetOptions()
+        self._enableMarkupsWidgetOptions()
+        self._refreshCenterlineTargets()
 
-        # Refresh the centerline-slicing slider/combo for this case.
-        if hasattr(self, "_refreshCenterlineTargets"):
-            self._refreshCenterlineTargets()
-
-        self.ui.status_checked.setText("Checked: " + str(self.current_index + 1) + " / " + str(self.n_files))
-
+    # ------------------------------------------------------------------
+    # Segment editor / markups widgets
+    # ------------------------------------------------------------------
     def _createSegmentEditorWidget_(self):
         import qSlicerSegmentationsModuleWidgetsPythonQt
         segmentEditorCollapsibleButton = ctk.ctkCollapsibleButton()
@@ -1878,101 +1744,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.initializeParameterNode()
         self._enableMarkupsWidgetOptions()
 
-    def overwrite_mask_clicked(self):
-        if not self.nifti_files or self.current_index >= len(self.nifti_files):
-            slicer.util.warningDisplay("No case is currently loaded.")
-            return
-        if self.directory is None:
-            slicer.util.warningDisplay("No output directory is set.")
-            return
-        
-        self.segmentation_node = slicer.mrmlScene.GetFirstNodeByClass('vtkMRMLSegmentationNode')
-        if not self.segmentation_node:
-            slicer.util.warningDisplay("No segmentation node found to save.")
-            return
-        
-        # 1. PRIMARY: Use the explicit 'case_id' from the JSON manifest
-        case_id = None
-        if hasattr(self, 'case_ids') and self.current_index < len(self.case_ids):
-            case_id = str(self.case_ids[self.current_index]).strip()
-            
-        # 2. FALLBACK 1: Use 'id_subs' if available (e.g., directory mode with mapping_unique.csv)
-        if not case_id and hasattr(self, 'id_subs') and self.current_index < len(self.id_subs):
-            case_id = str(self.id_subs[self.current_index]).strip()
-            
-        # 3. FALLBACK 2: Derive from the base filename without extensions
-        if not case_id:
-            filename = os.path.basename(self.nifti_files[self.current_index])
-            case_id = filename
-            for ext in ['.nii.gz', '.nii', '.nrrd']:
-                if case_id.lower().endswith(ext):
-                    case_id = case_id[:-len(ext)]
-                    break
-            else:
-                case_id = os.path.splitext(case_id)[0]
-        
-        # Sanitize the case_id to ensure it's a valid, safe filename
-        case_id = "".join(x for x in case_id if x.isalnum() or x in ('_', '-', '.')).strip()
-        if not case_id:
-            case_id = "unknown_case"
-
-        # Construct the new .seg.nrrd file path using the case_id
-        file_path_nrrd = self.joinpath(self.directory, f"{case_id}.seg.nrrd")
-        
-        # Update status and path tracking
-        self.seg_mask_status[self.current_index] = 3
-        self.segmentation_files[self.current_index] = file_path_nrrd
-        
-        # Save the segmentation node directly as .seg.nrrd
-        slicer.util.saveNode(self.segmentation_node, file_path_nrrd)
-        
-        # Provide visual confirmation to the user
-        slicer.util.infoDisplay(f"Segmentation saved successfully as:\n{file_path_nrrd}")
-
-    def joinpath(self, rootdir, targetdir):
-        return os.path.join(os.sep, rootdir + os.sep, targetdir)
-
-    def _is_valid_extension(self, path):
-        return any(path.endswith(i) for i in [".nii", ".nii.gz", ".nrrd"])
-
-    def _construct_full_path(self, path):
-        if not isinstance(path, str):
-            return ""
-        if os.path.isabs(path):
-            return path
-        else:
-            return self.joinpath(self.directory, path)
-
-    def _restore_index(self, ann_csv, files_list, mask_list, mask_status_list=None):
-        statuses, unchecked_files, unchecked_masks, checked_ids, id_subs_list = [], [], [], [], []
-        list_of_checked = ann_csv['file'].values
-        list_of_checked = [self._construct_full_path(i) for i in list_of_checked]
-        list_of_checked_masks = ann_csv['mask_path'].values
-        list_of_checked_masks = [self._construct_full_path(i) for i in list_of_checked_masks]
-        if self.unique_case_flag:
-            checked_ids = []
-            list_of_checked = ann_csv['file'].values
-            for id_subj, img, _ in zip(self.mappings["subj_id"], self.mappings["img_path"], self.mappings["mask_path"]):
-                if img in list_of_checked:
-                    checked_ids.append(id_subj)
-            for id_subj, img, mask in zip(self.mappings["subj_id"], self.mappings["img_path"], self.mappings["mask_path"]):
-                if id_subj not in checked_ids:
-                    id_subs_list.append(id_subj)
-                    unchecked_files.append(self._construct_full_path(img))
-                    if type(mask) == str:
-                        unchecked_masks.append(self._construct_full_path(mask))
-                        statuses.append(2)
-                    else:
-                        unchecked_masks.append("")
-                        statuses.append(0)
-        else:
-            for i in range(len(files_list)):
-                if files_list[i] not in list_of_checked:
-                    unchecked_files.append(files_list[i])
-                    unchecked_masks.append(mask_list[i])
-                    statuses.append(mask_status_list[i])
-        return unchecked_files, unchecked_masks, statuses, id_subs_list, checked_ids
-
     def getDefaultSourceVolumeNodeID(self):
         layoutManager = slicer.app.layoutManager()
         firstForegroundVolumeID = None
@@ -1998,131 +1769,9 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.parameterSetNode = segmentEditorNode
         self.segmentEditorWidget.setMRMLSegmentEditorNode(self.parameterSetNode)
 
-    def onAtlasDirectoryChanged(self, directory):
-        if hasattr(self, "inputModeDirectory") and not self.inputModeDirectory.isChecked():
-            return
-        self.json_mode = False
-        self.nifti_files = []
-        self.segmentation_files = []
-        self.seg_mask_status = []
-        self.id_subs = []
-        self.id_subs_checked = []
-        self.with_mapper_flag = False
-        self.finish_flag = False
-        self.current_index = 0
-        self.annulus_contour_node = None
-        self.contour_nodes_by_label = {}
-        self.centerline_nodes_by_label = {}
-        self.centerline_points_world = {}
-        self.centerline_arclength = {}
-        self.case_reviews = {}
-        self.directory = os.path.normpath(directory)
-        directory = self.directory
-        logger = logging.getLogger('TavrWorkbench')
-        logger.setLevel(logging.DEBUG)
-        fileHandler = logging.FileHandler(self.joinpath(directory, 'tavr_workbench.log'))
-        fileHandler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
-        logger.addHandler(fileHandler)
-        try:
-            slicer.mrmlScene.RemoveNode(self.volume_node)
-            slicer.mrmlScene.RemoveNode(self.segmentation_node)
-        except:
-            pass
-        self.unique_case_flag = False
-        if os.path.exists(self.joinpath(directory, "mapping_unique.csv")):
-            id_subs = []
-            self.mappings = pd.read_csv(self.joinpath(directory, "mapping_unique.csv"))
-            self.unique_case_flag = True
-            for id_subj, img, mask in zip(self.mappings["subj_id"], self.mappings["img_path"], self.mappings["mask_path"]):
-                if os.path.exists(self.joinpath(directory, img)) and self._is_valid_extension(self.joinpath(directory, img)):
-                    self.nifti_files.append(self.joinpath(directory, img))
-                    id_subs.append(id_subj)
-                    if type(mask) == str:
-                        if os.path.exists(self.joinpath(directory, mask)) and self._is_valid_extension(self.joinpath(directory, mask)):
-                            self.segmentation_files.append(self.joinpath(directory, mask))
-                            self.seg_mask_status.append(2)
-                        elif self._is_valid_extension(self.joinpath(directory, mask)) and not os.path.exists(self.joinpath(directory, mask)):
-                            self.segmentation_files.append("")
-                            self.seg_mask_status.append(1)
-                        else:
-                            self.segmentation_files.append("")
-                            self.seg_mask_status.append(0)
-                    else:
-                        self.segmentation_files.append("")
-                        self.seg_mask_status.append(0)
-            self.id_subs = id_subs
-        elif os.path.exists(self.joinpath(directory, "mapping.csv")):
-            self.mappings = pd.read_csv(self.joinpath(directory, "mapping.csv"))
-            self.with_mapper_flag = True
-            for img, mask in zip(self.mappings["img_path"], self.mappings["mask_path"]):
-                if os.path.exists(self.joinpath(directory, img)) and self._is_valid_extension(self.joinpath(directory, img)):
-                    self.nifti_files.append(self.joinpath(directory, img))
-                    if type(mask) == str:
-                        if os.path.exists(self.joinpath(directory, mask)) and self._is_valid_extension(self.joinpath(directory, mask)):
-                            self.segmentation_files.append(self.joinpath(directory, mask))
-                            self.seg_mask_status.append(2)
-                        elif self._is_valid_extension(self.joinpath(directory, mask)) and not os.path.exists(self.joinpath(directory, mask)):
-                            self.segmentation_files.append("")
-                            self.seg_mask_status.append(1)
-                        else:
-                            self.segmentation_files.append("")
-                            self.seg_mask_status.append(0)
-                    else:
-                        self.segmentation_files.append("")
-                        self.seg_mask_status.append(0)
-        else:
-            volume_extensions = (".nii.gz", ".nii", ".nrrd")
-            mask_suffixes = ("_mask.nii.gz", "_mask.nii", "_mask.nrrd")
-            for file in os.listdir(directory):
-                if self._is_valid_extension(file) and "_mask" not in file:
-                    self.nifti_files.append(self.joinpath(directory, file))
-                    base = file
-                    for ext in volume_extensions:
-                        if base.endswith(ext):
-                            base = base[: -len(ext)]
-                            break
-                    mask_found = False
-                    for suffix in mask_suffixes:
-                        candidate = self.joinpath(directory, base + suffix)
-                        if os.path.exists(candidate):
-                            self.segmentation_files.append(candidate)
-                            self.seg_mask_status.append(2)
-                            mask_found = True
-                            break
-                    if not mask_found:
-                        self.segmentation_files.append("")
-                        self.seg_mask_status.append(0)
-        self.current_index = 0
-        
-        self.total_samples_in_dataset = len(self.nifti_files)
-        
-        if os.path.exists(self.joinpath(directory, "annotations.csv")):
-            ann_csv = pd.read_csv(self.joinpath(directory, "annotations.csv"))
-            self.reviewed_count = len(ann_csv)
-            if self.unique_case_flag:
-                self.nifti_files, self.segmentation_files, self.seg_mask_status, self.id_subs, self.id_subs_checked = self._restore_index(
-                    ann_csv, self.nifti_files, self.segmentation_files, self.seg_mask_status)
-            else:
-                self.nifti_files, self.segmentation_files, self.seg_mask_status, _, _ = self._restore_index(
-                    ann_csv, self.nifti_files, self.segmentation_files, self.seg_mask_status)
-            
-            self._loadReviewsFromCSV()
-        else:
-            self.reviewed_count = 0
-        
-        self.pending_count = self.total_samples_in_dataset - self.reviewed_count
-        
-        self.n_files = len(self.nifti_files)
-        self.ui.measReviewContainer.setVisible(False)
-        self.ui.status_checked.setText("Checked: " + str(self.current_index + 1) + " / " + str(self.n_files))
-        self._updateSummary()
-        # Directory mode never has centerline data, so keep the centerline
-        # slicing controls disabled and empty.
-        if hasattr(self, "_refreshCenterlineTargets"):
-            self._refreshCenterlineTargets()
-        self.load_nifti_file(self.unique_case_flag)
-        self._restoreReview(self.current_index)
-
+    # ------------------------------------------------------------------
+    # Window/level + segment visibility persistence across cases
+    # ------------------------------------------------------------------
     def store_current_window_level_settings(self):
         if self.volume_node and self.volume_node.GetDisplayNode():
             self.window_level = (self.volume_node.GetDisplayNode().GetWindow(), self.volume_node.GetDisplayNode().GetLevel())
@@ -2137,7 +1786,7 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self.volume_node.GetDisplayNode().SetAutoWindowLevel(True)
 
     def store_segment_visiblity_states(self):
-        if not self.segmentation_node:
+        if not self.segmentation_node or not self.segmentation_node.GetDisplayNode():
             return
         for segment_id in self.segmentation_node.GetSegmentation().GetSegmentIDs():
             visibility = self.segmentation_node.GetDisplayNode().GetSegmentVisibility(segment_id)
@@ -2149,49 +1798,6 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         for segment_id in self.segmentation_node.GetSegmentation().GetSegmentIDs():
             visibility = self.segment_visiblity_states.get(segment_id, True)
             self.segmentation_node.GetDisplayNode().SetSegmentVisibility(segment_id, visibility)
-
-    def load_nifti_file(self, unique=False):
-        nodes_to_remove = set()
-        for node in [self.volume_node, self.segmentation_node, self.pointListNode, self.segmentEditorWidget.segmentationNode()]:
-            if node:
-                nodes_to_remove.add(node)
-        for node in nodes_to_remove:
-            slicer.mrmlScene.RemoveNode(node)
-        self.volume_node = None
-        self.segmentation_node = None
-        self.pointListNode = None
-        self.annulus_contour_node = None
-        self.contour_nodes_by_label = {}
-        slicer.util.resetSliceViews()
-        if unique:
-            if self.current_index < self.n_files and self.id_subs[self.current_index] in self.id_subs_checked:
-                return 0
-            elif self.current_index == self.n_files:
-                return 1
-        slicer.app.layoutManager().setRenderPaused(True)
-        try:
-            self.volume_node = slicer.util.loadVolume(self.nifti_files[self.current_index])
-            if self.volume_node:
-                slicer.util.setSliceViewerLayers(background=self.volume_node)
-            self.restore_window_level_settings()
-            try:
-                if self.segmentation_files[self.current_index]:
-                    self.segmentation_node = slicer.util.loadSegmentation(self.segmentation_files[self.current_index])
-                    if self.segmentation_node:
-                        self.restore_segment_visiblity_states()
-                        self.set_segmentation_and_mask_for_segmentation_editor()
-            except Exception as e:
-                print(f"Warning: could not load segmentation in load_nifti_file: {e}")
-                if not unique:
-                    self.enter()
-        finally:
-            slicer.app.layoutManager().setRenderPaused(False)
-            slicer.app.processEvents()
-        layoutManager = slicer.app.layoutManager()
-        for sliceViewName in layoutManager.sliceViewNames():
-            layoutManager.sliceWidget(sliceViewName).sliceLogic().FitSliceToAll()
-        self._enableMarkupsWidgetOptions()
-        return None
 
     def set_segmentation_and_mask_for_segmentation_editor(self):
         slicer.app.processEvents()
@@ -2205,18 +1811,29 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         stats = segStatLogic.getStatistics()
         self.pointListNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode")
         self.pointListNode.CreateDefaultDisplayNodes()
-        self.pointListNode.SetName(f"Centroids_{self.case_ids[self.current_index] if self.current_index < len(self.case_ids) else self.current_index}")
+        self.pointListNode.SetName(f"Centroids_{self.caseId()}")
         markupsLogic = slicer.modules.markups.logic()
         for segmentId in stats["SegmentIDs"]:
             if self.segment_visiblity_states.get(segmentId, True):
                 centroid_ras = stats[segmentId, "LabelmapSegmentStatisticsPlugin.centroid_ras"]
                 markupsLogic.JumpSlicesToLocation(*centroid_ras, False)
 
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
     def cleanup(self):
+        for sc in getattr(self, "_shortcuts", []):
+            try:
+                sc.setEnabled(False)
+                sc.setParent(None)
+            except Exception:
+                pass
+        self._shortcuts = []
         self.removeObservers()
 
     def exit(self):
-        self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self.updateGUIFromParameterNode)
+        if self._parameterNode is not None:
+            self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self.updateGUIFromParameterNode)
 
     def onSceneStartClose(self, caller, event):
         try:
@@ -2225,6 +1842,15 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.segmentEditorWidget.removeViewObservations()
         except:
             pass
+        # Scene is being wiped: our node handles are about to become stale.
+        self.volume_node = None
+        self.segmentation_node = None
+        self.pointListNode = None
+        self.loaded_markup_nodes = []
+        self.loaded_model_nodes = []
+        self.contour_nodes_by_label = {}
+        self.centerline_nodes_by_label = {}
+        self._case_loaded = False
 
     def onSceneEndClose(self, caller, event):
         if self.parent.isEntered:
