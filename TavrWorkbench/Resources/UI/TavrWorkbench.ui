@@ -1,159 +1,96 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- TavrWorkbench.ui - User interface definition for the TavrWorkbench module  -->
+<!-- TavrWorkbench.ui - static layout; rating tables, segment editor and button groups are added in Python -->
 <ui version="4.0">
- <class>NiftyViewer</class>
- <widget class="qMRMLWidget" name="NiftyViewer">
+ <class>TavrWorkbench</class>
+ <widget class="qMRMLWidget" name="TavrWorkbench">
   <property name="geometry">
    <rect>
     <x>0</x>
     <y>0</y>
     <width>420</width>
-    <height>900</height>
+    <height>1000</height>
    </rect>
   </property>
-  <layout class="QVBoxLayout" name="verticalLayout">
+  <layout class="QVBoxLayout" name="mainLayout">
+   <!-- ============================== Cases ============================== -->
    <item>
-    <widget class="QLabel" name="status_checked">
+    <widget class="ctkCollapsibleButton" name="inputCollapsibleButton">
      <property name="text">
-      <string>No case list loaded</string>
+      <string>Cases</string>
      </property>
-    </widget>
-   </item>
-   <item>
-    <widget class="ctkCollapsibleButton" name="reviewCollapsibleButton">
-     <property name="text">
-      <string>Review</string>
-     </property>
-     <layout class="QVBoxLayout" name="reviewLayout">
-      <!-- Overall Decision Row -->
-      <item>
-       <layout class="QHBoxLayout" name="overallRatingLayout">
-        <item>
-         <widget class="QLabel" name="overallLabel">
-          <property name="text">
-           <string>&lt;b&gt;Overall:&lt;/b&gt;</string>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QRadioButton" name="radio_accept">
-          <property name="text">
-           <string>✓ Approve</string>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QRadioButton" name="radio_flag">
-          <property name="text">
-           <string>⚑ Flag for review</string>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QPushButton" name="clear_overall">
-          <property name="text">
-           <string>Clear</string>
-          </property>
-          <property name="maximumSize">
-           <size>
-            <width>60</width>
-            <height>16777215</height>
-           </size>
-          </property>
-         </widget>
-        </item>
-       </layout>
-      </item>
-      <!-- Comment Row -->
-      <item>
-       <layout class="QHBoxLayout" name="commentLayout">
-        <item>
-         <widget class="QLabel" name="commentLabel">
-          <property name="text">
-           <string>Comment:</string>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QPlainTextEdit" name="comment">
-          <property name="maximumSize">
-           <size>
-            <width>16777215</width>
-            <height>40</height>
-           </size>
-          </property>
-         </widget>
-        </item>
-       </layout>
-      </item>
-      <!-- Segmentation Review Container (populated by Python) -->
-      <item>
-       <widget class="QWidget" name="segReviewContainer" native="true"/>
-      </item>
-      <!-- Measurement Review Container (populated by Python) -->
-      <item>
-       <widget class="QWidget" name="measReviewContainer" native="true"/>
-      </item>
-      <!-- Summary Section -->
-      <item>
-       <widget class="Line" name="summaryLine">
-        <property name="orientation">
-         <enum>Qt::Horizontal</enum>
-        </property>
-       </widget>
-      </item>
-      <item>
-       <widget class="QLabel" name="summaryTitle">
+     <layout class="QFormLayout" name="inputForm">
+      <item row="0" column="0">
+       <widget class="QLabel" name="mapLabel">
         <property name="text">
-         <string>&lt;b&gt;Summary&lt;/b&gt;</string>
+         <string>Data map (.json):</string>
         </property>
        </widget>
       </item>
-      <item>
-       <widget class="QLabel" name="summaryTotal">
+      <item row="0" column="1">
+       <widget class="ctkPathLineEdit" name="mapPathEdit">
+        <property name="toolTip">
+         <string>Select the data-map .json (browse button on the right)</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="outLabel">
         <property name="text">
-         <string>Total Samples in Dataset: 0</string>
+         <string>Output folder:</string>
         </property>
        </widget>
       </item>
-      <item>
-       <widget class="QLabel" name="summaryReviewed">
+      <item row="1" column="1">
+       <widget class="ctkPathLineEdit" name="outPathEdit">
+        <property name="toolTip">
+         <string>Reviews, edited masks, corrected contours, CSVs and progress are saved here</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0" colspan="2">
+       <widget class="QPushButton" name="loadListButton">
         <property name="text">
-         <string>Reviewed: 0</string>
+         <string>Load case list</string>
         </property>
        </widget>
       </item>
-      <item>
-       <widget class="QLabel" name="summaryPending">
+      <item row="3" column="0">
+       <widget class="QLabel" name="caseLabel">
         <property name="text">
-         <string>Pending: 0</string>
+         <string>Case:</string>
         </property>
        </widget>
       </item>
-      <!-- Navigation Buttons -->
-      <item>
-       <layout class="QHBoxLayout" name="buttonLayout">
+      <item row="3" column="1">
+       <widget class="QComboBox" name="caseCombo">
+        <property name="toolTip">
+         <string>First mark: segmentation, second: measurements (✓ approved, ⚑ flagged, · pending, – no measurements)</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="0" colspan="2">
+       <layout class="QHBoxLayout" name="navLayout">
         <item>
-         <widget class="QPushButton" name="previous_case">
+         <widget class="QPushButton" name="prevCaseButton">
           <property name="text">
-           <string>← Previous</string>
+           <string>◀ Previous</string>
           </property>
          </widget>
         </item>
         <item>
-         <widget class="QPushButton" name="skip_case">
+         <widget class="QPushButton" name="nextCaseButton">
           <property name="text">
-           <string>Skip →</string>
+           <string>Next ▶</string>
           </property>
          </widget>
         </item>
         <item>
-         <widget class="QPushButton" name="save_and_next">
-          <property name="text">
-           <string>Save &amp; Next →</string>
+         <widget class="QPushButton" name="nextUnreviewedButton">
+          <property name="toolTip">
+           <string>Next case not yet reviewed in the current mode</string>
           </property>
-          <property name="shortcut">
-           <string>Shift+Return</string>
+          <property name="text">
+           <string>Next unreviewed ⏭</string>
           </property>
          </widget>
         </item>
@@ -163,11 +100,650 @@
     </widget>
    </item>
    <item>
-    <widget class="QPushButton" name="overwrite_mask">
-     <property name="text">
-      <string>Save Mask</string>
+    <widget class="QFrame" name="separator1">
+     <property name="minimumSize">
+      <size>
+       <width>0</width>
+       <height>1</height>
+      </size>
+     </property>
+     <property name="maximumSize">
+      <size>
+       <width>16777215</width>
+       <height>1</height>
+      </size>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">background-color: white;</string>
      </property>
     </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="statusLabel">
+     <property name="text">
+      <string>No case list loaded</string>
+     </property>
+    </widget>
+   </item>
+   <!-- ============================== Mode switch ============================== -->
+   <item>
+    <widget class="QWidget" name="modeWidget" native="true">
+     <layout class="QHBoxLayout" name="modeLayout">
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <item>
+       <widget class="QLabel" name="modeLabel">
+        <property name="text">
+         <string>&lt;b&gt;Review:&lt;/b&gt;</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="segModeButton">
+        <property name="text">
+         <string>Segmentation</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="measModeButton">
+        <property name="text">
+         <string>Measurements</string>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <!-- ============================== Segmentation panel ============================== -->
+   <item>
+    <widget class="QFrame" name="separator2">
+     <property name="minimumSize">
+      <size>
+       <width>0</width>
+       <height>1</height>
+      </size>
+     </property>
+     <property name="maximumSize">
+      <size>
+       <width>16777215</width>
+       <height>1</height>
+      </size>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">background-color: white;</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QWidget" name="segPanel" native="true">
+     <layout class="QVBoxLayout" name="segPanelLayout">
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <item>
+       <widget class="QWidget" name="segDecisionWidget" native="true">
+        <layout class="QHBoxLayout" name="segDecisionLayout">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <item>
+          <widget class="QLabel" name="segDecisionLabel">
+           <property name="text">
+            <string>&lt;b&gt;Overall:&lt;/b&gt;</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QRadioButton" name="segApproveRadio">
+           <property name="text">
+            <string>✓ Approve</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QRadioButton" name="segFlagRadio">
+           <property name="text">
+            <string>⚑ Flag for review</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="segClearButton">
+           <property name="text">
+            <string>Clear</string>
+           </property>
+           <property name="maximumSize">
+            <size>
+             <width>60</width>
+             <height>16777215</height>
+            </size>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+      <item>
+       <widget class="QFrame" name="separator3">
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>1</height>
+         </size>
+        </property>
+        <property name="maximumSize">
+         <size>
+          <width>16777215</width>
+          <height>1</height>
+         </size>
+        </property>
+        <property name="styleSheet">
+         <string notr="true">background-color: white;</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QWidget" name="segReviewContainer" native="true"/>
+      </item>
+      <item>
+       <widget class="QFrame" name="separator4">
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>1</height>
+         </size>
+        </property>
+        <property name="maximumSize">
+         <size>
+          <width>16777215</width>
+          <height>1</height>
+         </size>
+        </property>
+        <property name="styleSheet">
+         <string notr="true">background-color: white;</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <layout class="QHBoxLayout" name="segOptionsLayout">
+        <item>
+         <widget class="QCheckBox" name="showMeasurementsCheck">
+          <property name="toolTip">
+           <string>Show contours, heights, hinge points and centerline (locked) while reviewing the segmentation</string>
+          </property>
+          <property name="text">
+           <string>Show measurements</string>
+          </property>
+          <property name="checked">
+           <bool>true</bool>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="saveMaskButton">
+          <property name="toolTip">
+           <string>Save the edited segmentation to &lt;output&gt;/&lt;case&gt;/segmentation.seg.nrrd (the original label is never touched)</string>
+          </property>
+          <property name="text">
+           <string>Save mask</string>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
+       <widget class="ctkCollapsibleButton" name="segEditorCollapsibleButton">
+        <property name="text">
+         <string>Segment Editor</string>
+        </property>
+        <layout class="QVBoxLayout" name="segEditorLayout">
+         <item>
+          <widget class="QWidget" name="segEditorContainer" native="true"/>
+         </item>
+        </layout>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <!-- ============================== Measurements panel ============================== -->
+   <item>
+    <widget class="QWidget" name="measPanel" native="true">
+     <layout class="QVBoxLayout" name="measPanelLayout">
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <item>
+       <widget class="QLabel" name="measUnavailableLabel">
+        <property name="text">
+         <string>&lt;i&gt;No contours for this case.&lt;/i&gt;</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QGroupBox" name="measViewGroupBox">
+        <property name="title">
+         <string>View</string>
+        </property>
+        <layout class="QFormLayout" name="measViewForm">
+         <item row="0" column="0">
+          <widget class="QLabel" name="contoursLabel">
+           <property name="text">
+            <string>Contours:</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="1">
+          <layout class="QHBoxLayout" name="contourRadioLayout">
+           <item>
+            <widget class="QRadioButton" name="selAnnulusRadio">
+             <property name="text">
+              <string>ANNULUS</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QRadioButton" name="selSovRadio">
+             <property name="text">
+              <string>SOV</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QRadioButton" name="selStjRadio">
+             <property name="text">
+              <string>STJ</string>
+             </property>
+            </widget>
+           </item>
+          </layout>
+         </item>
+         <item row="1" column="0">
+          <widget class="QLabel" name="heightsRowLabel">
+           <property name="text">
+            <string>Heights:</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="1">
+          <layout class="QHBoxLayout" name="heightRadioLayout">
+           <item>
+            <widget class="QRadioButton" name="selStjHRadio">
+             <property name="text">
+              <string>STJ-H</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QRadioButton" name="selLchRadio">
+             <property name="text">
+              <string>LCH</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QRadioButton" name="selRchRadio">
+             <property name="text">
+              <string>RCH</string>
+             </property>
+            </widget>
+           </item>
+          </layout>
+         </item>
+         <item row="2" column="0" colspan="2">
+          <layout class="QHBoxLayout" name="viewOptionsLayout">
+           <item>
+            <widget class="QCheckBox" name="showAllHeightsCheck">
+             <property name="toolTip">
+              <string>Checked: all heights are shown.
+Unchecked: only the selected height is shown (all heights are shown while a contour is selected).</string>
+             </property>
+             <property name="text">
+              <string>Show all heights</string>
+             </property>
+             <property name="checked">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QCheckBox" name="showSegOutlineCheck">
+             <property name="text">
+              <string>Segmentation outline</string>
+             </property>
+            </widget>
+           </item>
+          </layout>
+         </item>
+        </layout>
+       </widget>
+      </item>
+      <item>
+       <widget class="QFrame" name="separator5">
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>1</height>
+         </size>
+        </property>
+        <property name="maximumSize">
+         <size>
+          <width>16777215</width>
+          <height>1</height>
+         </size>
+        </property>
+        <property name="styleSheet">
+         <string notr="true">background-color: white;</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QGroupBox" name="measEditGroupBox">
+        <property name="title">
+         <string>Contour editing</string>
+        </property>
+        <layout class="QVBoxLayout" name="measEditLayout">
+         <item>
+          <layout class="QHBoxLayout" name="controlPointsLayout">
+           <item>
+            <widget class="QLabel" name="nPtsLabel">
+             <property name="text">
+              <string>Control pts:</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QSpinBox" name="nPtsSpinBox">
+             <property name="minimum">
+              <number>6</number>
+             </property>
+             <property name="maximum">
+              <number>60</number>
+             </property>
+             <property name="value">
+              <number>12</number>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="resampleButton">
+             <property name="toolTip">
+              <string>Resample the active contour to the given number of evenly spaced control points</string>
+             </property>
+             <property name="text">
+              <string>Resample</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="resetPlaneButton">
+             <property name="toolTip">
+              <string>Restore the original contour from the data map</string>
+             </property>
+             <property name="text">
+              <string>Reset</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="alignViewButton">
+             <property name="text">
+              <string>Align view</string>
+             </property>
+            </widget>
+           </item>
+          </layout>
+         </item>
+         <item>
+          <widget class="QLabel" name="metricsLabel">
+           <property name="textFormat">
+            <enum>Qt::RichText</enum>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="heightsLabel">
+           <property name="textFormat">
+            <enum>Qt::RichText</enum>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+      <item>
+       <widget class="QFrame" name="separator6">
+        <property name="minimumSize">
+         <size>
+          <width>0</width>
+          <height>1</height>
+         </size>
+        </property>
+        <property name="maximumSize">
+         <size>
+          <width>16777215</width>
+          <height>1</height>
+         </size>
+        </property>
+        <property name="styleSheet">
+         <string notr="true">background-color: white;</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QWidget" name="measDecisionWidget" native="true">
+        <layout class="QHBoxLayout" name="measDecisionLayout">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <item>
+          <widget class="QLabel" name="measDecisionLabel">
+           <property name="text">
+            <string>&lt;b&gt;Overall:&lt;/b&gt;</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QRadioButton" name="measApproveRadio">
+           <property name="text">
+            <string>✓ Approve</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QRadioButton" name="measFlagRadio">
+           <property name="text">
+            <string>⚑ Flag for review</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="measClearButton">
+           <property name="text">
+            <string>Clear</string>
+           </property>
+           <property name="maximumSize">
+            <size>
+             <width>60</width>
+             <height>16777215</height>
+            </size>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </widget>
+      </item>
+      <item>
+       <widget class="ctkCollapsibleButton" name="measItemsCollapsibleButton">
+        <property name="text">
+         <string>Per-item ratings (optional)</string>
+        </property>
+        <property name="collapsed">
+         <bool>true</bool>
+        </property>
+        <layout class="QVBoxLayout" name="measItemsLayout">
+         <item>
+          <widget class="QWidget" name="measReviewContainer" native="true"/>
+         </item>
+        </layout>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <!-- ============================== Shared: comment, save, summary ============================== -->
+   <item>
+    <widget class="QFrame" name="separator7">
+     <property name="minimumSize">
+      <size>
+       <width>0</width>
+       <height>1</height>
+      </size>
+     </property>
+     <property name="maximumSize">
+      <size>
+       <width>16777215</width>
+       <height>1</height>
+      </size>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">background-color: white;</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="commentLayout">
+     <item>
+      <widget class="QLabel" name="commentLabel">
+       <property name="text">
+        <string>Comment:</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPlainTextEdit" name="commentEdit">
+       <property name="maximumSize">
+        <size>
+         <width>16777215</width>
+         <height>50</height>
+        </size>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="saveLayout">
+     <item>
+      <widget class="QPushButton" name="saveButton">
+       <property name="toolTip">
+        <string>Save whatever has been decided or edited for this case, stay on it</string>
+       </property>
+       <property name="text">
+        <string>Save</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="saveNextButton">
+       <property name="toolTip">
+        <string>Save (requires a decision for the current mode) and open the next case  [Shift+Return]</string>
+       </property>
+       <property name="text">
+        <string>Save &amp;&amp; Next →</string>
+       </property>
+       <property name="shortcut">
+        <string>Shift+Return</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QFrame" name="separator8">
+     <property name="minimumSize">
+      <size>
+       <width>0</width>
+       <height>1</height>
+      </size>
+     </property>
+     <property name="maximumSize">
+      <size>
+       <width>16777215</width>
+       <height>1</height>
+      </size>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">background-color: white;</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="saveLabel">
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="summarySegLabel">
+     <property name="text">
+      <string>Segmentation: 0 / 0 reviewed</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="summaryMeasLabel">
+     <property name="text">
+      <string>Measurements: 0 / 0 reviewed</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="openOutputButton">
+     <property name="text">
+      <string>Open output folder</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <spacer name="verticalSpacer">
+     <property name="orientation">
+      <enum>Qt::Vertical</enum>
+     </property>
+     <property name="sizeHint" stdset="0">
+      <size>
+       <width>20</width>
+       <height>20</height>
+      </size>
+     </property>
+    </spacer>
    </item>
   </layout>
  </widget>
@@ -177,6 +753,11 @@
    <extends>QWidget</extends>
    <header>ctkCollapsibleButton.h</header>
    <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>ctkPathLineEdit</class>
+   <extends>QWidget</extends>
+   <header>ctkPathLineEdit.h</header>
   </customwidget>
   <customwidget>
    <class>qMRMLWidget</class>
