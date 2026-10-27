@@ -4,8 +4,9 @@
 #   curl -fsSL https://raw.githubusercontent.com/pcdslab/TavrWorkbench/main/install/install_mac.sh | bash
 #
 # Installs 3D Slicer (latest stable, verified with its SHA-512), downloads TavrWorkbench from GitHub,
-# adds it to Slicer's module paths and to the Favorite modules toolbar. Safe to run again: it then
-# just updates TavrWorkbench and reuses the Slicer it installed before.
+# registers it in Slicer (startup file in the home folder + module paths setting), adds it to the
+# Favorite modules toolbar, and checks that it actually loads. Safe to run again: it then just
+# updates TavrWorkbench and reuses the Slicer it installed before.
 #
 # Optional environment variables (put them before "bash", e.g. "... | TAVR_BRANCH=dev bash"):
 #   TAVR_BRANCH=main         GitHub branch to install
@@ -22,8 +23,6 @@ MODULE_DIR="$SOURCE_DIR/$MODULE_NAME"
 MARKER="$INSTALL_ROOT/slicer_app.txt"   # path of the Slicer.app this installer set up
 LOG="$INSTALL_ROOT/install.log"
 MIN_FREE_GB=4
-USER_APPS="$HOME/Applications"          # Slicer must be user-owned to save its settings
-OLD_SLICER_APP=""                       # set when an older install in /Applications was moved
 
 mkdir -p "$INSTALL_ROOT"
 exec > >(tee -a "$LOG") 2>&1
@@ -52,8 +51,23 @@ json_get() {
         "$1" "$2"
 }
 
+# Download with resume: an interrupted transfer continues where it stopped (up to 8 attempts).
+# The progress bar goes to the terminal only, so it does not fill the log.
 download() {  # url, output file
-    curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 --progress-bar -o "$2" "$1"
+    local url="$1" out="$2" attempt status progress=/dev/null
+    if { : >/dev/tty; } 2>/dev/null; then progress=/dev/tty; fi
+    rm -f "$out"
+    for attempt in 1 2 3 4 5 6 7 8; do
+        status=0
+        curl -fL -C - --connect-timeout 30 --speed-limit 1024 --speed-time 60 --progress-bar \
+            -o "$out" "$url" 2>"$progress" || status=$?
+        if [ "$status" -eq 0 ]; then return 0; fi
+        # 33: server cannot resume -> start over; 22: HTTP error (e.g. 416 on a stale partial file)
+        if [ "$status" -eq 33 ] || [ "$status" -eq 22 ]; then rm -f "$out"; fi
+        echo "Download interrupted (curl error $status, attempt $attempt of 8); continuing in 10 s ..."
+        sleep 10
+    done
+    return 1
 }
 
 plist_version() {
@@ -101,29 +115,13 @@ ensure_rosetta() {
     arch -x86_64 /usr/bin/true >/dev/null 2>&1 || die "Rosetta 2 could not be installed."
 }
 
-install_slicer() {
-    # Re-runs reuse the Slicer installed earlier (only TavrWorkbench is updated)
-    if [ "${TAVR_UPDATE_SLICER:-0}" != "1" ] && [ -f "$MARKER" ]; then
+install_slicer() {  # optional argument "fresh": ignore the Slicer recorded by an earlier run
+    if [ "${1:-}" != "fresh" ] && [ "${TAVR_UPDATE_SLICER:-0}" != "1" ] && [ -f "$MARKER" ]; then
         local previous
         previous="$(cat "$MARKER")"
         if [ -x "$previous/Contents/MacOS/Slicer" ]; then
-            case "$previous" in
-                "$USER_APPS"/*)
-                    SLICER_APP="$previous"
-                    say "Using the Slicer installed earlier: $SLICER_APP"
-                    return 0
-                    ;;
-            esac
-            # Earlier installer versions used /Applications, where Slicer cannot save the module path.
-            local moved
-            moved="$USER_APPS/$(basename "$previous")"
-            say "Moving Slicer to $USER_APPS (Slicer cannot save its settings in /Applications)"
-            mkdir -p "$USER_APPS"
-            rm -rf "$moved"
-            ditto "$previous" "$moved" || die "Could not copy Slicer to $USER_APPS."
-            SLICER_APP="$moved"
-            OLD_SLICER_APP="$previous"
-            echo "$SLICER_APP" >"$MARKER"
+            SLICER_APP="$previous"
+            say "Using the Slicer installed earlier: $SLICER_APP"
             return 0
         fi
     fi
@@ -141,10 +139,8 @@ install_slicer() {
     case "$url" in http*) ;; *) url="https://download.slicer.org$url" ;; esac
     echo "Slicer $version"
 
-    # Always the user's own Applications folder: Slicer keeps its module-path settings inside
-    # Slicer.app, and macOS silently blocks those writes for apps in the shared /Applications.
-    local apps="$USER_APPS"
-    mkdir -p "$apps"
+    local apps="/Applications"
+    if [ ! -w "$apps" ]; then apps="$HOME/Applications"; mkdir -p "$apps"; fi
     local dest="$apps/Slicer.app"
     # Never overwrite a different Slicer the user already has
     if [ -e "$dest" ] && [ "$(plist_version "$dest")" != "$version" ]; then dest="$apps/Slicer $version.app"; fi
@@ -153,7 +149,8 @@ install_slicer() {
         echo "Slicer $version is already installed: $dest"
     else
         say "Downloading Slicer $version (about 450 MB)"
-        download "$url" "$WORK/Slicer.dmg" || die "Could not download Slicer."
+        download "$url" "$WORK/Slicer.dmg" \
+            || die "Could not download Slicer (the connection kept dropping). Please run the command again."
         if [ -n "$sha" ]; then
             local actual
             actual="$(shasum -a 512 "$WORK/Slicer.dmg" | awk '{print $1}')"
@@ -170,7 +167,8 @@ install_slicer() {
         local src
         src="$(find "$MNT" -maxdepth 1 -name '*.app' -print -quit)"
         [ -n "$src" ] || die "No application found in the Slicer disk image."
-        rm -rf "$dest"
+        rm -rf "$dest" 2>/dev/null || true
+        [ ! -e "$dest" ] || die "Could not replace $dest. Drag it to the Trash, then run the command again."
         ditto "$src" "$dest" || die "Could not copy Slicer to $apps."
         hdiutil detach "$MNT" -quiet >/dev/null 2>&1 || hdiutil detach "$MNT" -force -quiet >/dev/null 2>&1 || true
         MNT=""
@@ -181,24 +179,28 @@ install_slicer() {
     echo "$SLICER_APP" >"$MARKER"
 }
 
+# Runs install/configure_slicer.py inside Slicer. Returns 0 on success, 2 when macOS stopped Slicer
+# before it could do anything (e.g. "Killed: 9" for a damaged app), 1 for any other failure.
 run_slicer_script() {  # mode (configure|verify), extra Slicer arguments...
     local mode="$1"; shift
     local result="$WORK/${mode}_result.txt" slicer_log="$WORK/${mode}_slicer.log"
     rm -f "$result"
     TAVR_MODE="$mode" TAVR_MODULE_DIR="$MODULE_DIR" TAVR_RESULT_FILE="$result" \
-        "$SLICER_APP/Contents/MacOS/Slicer" --no-splash --no-main-window --ignore-slicerrc "$@" \
+        "$SLICER_APP/Contents/MacOS/Slicer" --no-splash --no-main-window "$@" \
         --python-script "$SOURCE_DIR/install/configure_slicer.py" >"$slicer_log" 2>&1 &
-    local pid=$! waited=0 grace=0
+    local pid=$! waited=0 grace=0 status=0 stopped_by_us=0
     # First start of Slicer can take a while; stop waiting 20 s after the result is written
     while kill -0 "$pid" 2>/dev/null; do
         if [ -s "$result" ]; then grace=$((grace + 2)); fi
-        if [ "$grace" -ge 20 ] || [ "$waited" -ge 600 ]; then break; fi
+        if [ "$grace" -ge 20 ] || [ "$waited" -ge 600 ]; then stopped_by_us=1; break; fi
         sleep 2
         waited=$((waited + 2))
     done
-    kill "$pid" 2>/dev/null || true
-    pkill -f "configure_slicer.py" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    if [ "$stopped_by_us" -eq 1 ]; then
+        kill "$pid" 2>/dev/null || true
+        pkill -f "configure_slicer.py" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || status=$?
 
     if [ -s "$result" ] && head -n 1 "$result" | grep -q '^OK'; then
         tail -n +2 "$result"
@@ -207,17 +209,39 @@ run_slicer_script() {  # mode (configure|verify), extra Slicer arguments...
     echo "----- Slicer output -----"
     cat "$slicer_log" 2>/dev/null || true
     echo "----- Result -----"
-    cat "$result" 2>/dev/null || echo "(Slicer did not report a result)"
+    cat "$result" 2>/dev/null || echo "(Slicer did not report a result; exit status $status)"
+    if [ ! -s "$result" ] && [ "$stopped_by_us" -eq 0 ] && [ "$status" -ge 128 ]; then return 2; fi
     return 1
 }
 
 configure_slicer() {
-    say "Adding TavrWorkbench to Slicer (module path + Favorite modules)"
-    run_slicer_script configure --disable-cli-modules --disable-scripted-loadable-modules \
-        || die "Slicer could not be configured."
+    say "Adding TavrWorkbench to Slicer"
+    local rc=0
+    run_slicer_script configure --ignore-slicerrc --disable-cli-modules --disable-scripted-loadable-modules || rc=$?
+    if [ "$rc" -eq 2 ]; then
+        # This copy of Slicer cannot start (macOS stops it). Use a clean copy from the official download.
+        say "macOS stopped $SLICER_APP from starting; setting up a clean copy of Slicer"
+        local broken="$SLICER_APP"
+        rm -f "$MARKER"
+        install_slicer fresh
+        if [ "$SLICER_APP" = "$broken" ]; then
+            # The standard location holds the broken copy itself: replace it with a fresh download
+            rm -rf "$broken" 2>/dev/null || true
+            [ ! -e "$broken" ] || die "Slicer at $broken cannot start. Drag it to the Trash, then run the command again."
+            install_slicer fresh
+        elif [ -e "$broken" ]; then
+            # A copy made by an earlier installer version: remove it so it is not opened by mistake
+            case "$broken" in
+                "$HOME/Applications/"*) rm -rf "$broken" 2>/dev/null || true ;;
+            esac
+        fi
+        rc=0
+        run_slicer_script configure --ignore-slicerrc --disable-cli-modules --disable-scripted-loadable-modules || rc=$?
+    fi
+    [ "$rc" -eq 0 ] || die "Slicer could not be configured."
+
     say "Checking that TavrWorkbench loads in Slicer"
-    run_slicer_script verify --disable-cli-modules \
-        || die "TavrWorkbench was added to Slicer but does not load."
+    run_slicer_script verify --disable-cli-modules || die "TavrWorkbench was added to Slicer but does not load."
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -228,11 +252,7 @@ install_slicer
 configure_slicer
 
 say "Done. TavrWorkbench is ready."
-echo "Start Slicer from: $SLICER_APP  (also found with Spotlight: Cmd+Space, type Slicer)"
-if [ -n "$OLD_SLICER_APP" ]; then
-    echo "The old copy in $OLD_SLICER_APP is no longer used: drag it to the Trash to free space,"
-    echo "and use the Slicer in $USER_APPS from now on."
-fi
+echo "Start Slicer from: $SLICER_APP  (or Spotlight: Cmd+Space, type Slicer)"
 echo "TavrWorkbench is in the Favorite modules toolbar (and under Modules > Examples)."
 echo "To update TavrWorkbench later, run the same install command again."
 

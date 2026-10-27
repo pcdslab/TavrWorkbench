@@ -36,9 +36,16 @@
         # curl.exe ships with Windows 10 1803+ and is faster and more robust than Invoke-WebRequest
         $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
         if ($curl) {
-            & $curl.Source -fL --retry 5 --retry-delay 5 --connect-timeout 30 --progress-bar -o $OutFile $Url
-            if ($LASTEXITCODE -eq 0) { return }
-            Write-Warning "curl.exe failed (exit code $LASTEXITCODE), trying again with Invoke-WebRequest"
+            # -C - resumes an interrupted transfer where it stopped
+            Remove-Item $OutFile -ErrorAction SilentlyContinue
+            for ($i = 1; $i -le 8; $i++) {
+                & $curl.Source -fL -C - --connect-timeout 30 --speed-limit 1024 --speed-time 60 --progress-bar -o $OutFile $Url
+                if ($LASTEXITCODE -eq 0) { return }
+                if ($LASTEXITCODE -eq 33 -or $LASTEXITCODE -eq 22) { Remove-Item $OutFile -ErrorAction SilentlyContinue }
+                Write-Host "Download interrupted (curl error $LASTEXITCODE, attempt $i of 8); continuing in 10 s ..."
+                Start-Sleep -Seconds 10
+            }
+            Write-Warning 'curl.exe kept failing, trying again with Invoke-WebRequest'
         }
         for ($i = 1; $i -le 3; $i++) {
             try { Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing; return }

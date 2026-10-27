@@ -37,15 +37,14 @@ shows "Windows protected your PC", click **More info → Run anyway**.
 
 |                 | macOS                                                     | Windows                                   |
 |-----------------|-----------------------------------------------------------|-------------------------------------------|
-| 3D Slicer       | `~/Applications/Slicer.app` (your own Applications folder) | `%LOCALAPPDATA%\slicer.org\Slicer <version>` |
+| 3D Slicer       | `/Applications/Slicer.app` (or `~/Applications`)          | `%LOCALAPPDATA%\slicer.org\Slicer <version>` |
 | TavrWorkbench   | `~/Library/Application Support/TavrWorkbench/source`      | `%LOCALAPPDATA%\TavrWorkbench\source`     |
 | Install log     | `~/Library/Application Support/TavrWorkbench/install.log` | `%LOCALAPPDATA%\TavrWorkbench\install.log` |
 
-On macOS Slicer goes into your own Applications folder (Finder: Go → Home → Applications, or Spotlight:
-`⌘ Space`, type *Slicer*), not the shared one: Slicer saves its module settings inside the app, and macOS
-blocks that for apps in the shared `/Applications` folder. If an earlier install put Slicer in
-`/Applications`, running the command again moves it; you can then drag the old copy to the Trash.
 An existing `Slicer.app` of a different version is left alone; the new one is installed as `Slicer <version>.app`.
+
+TavrWorkbench is loaded by a short, clearly marked block in Slicer's startup file in your home folder
+(`~/.slicerrc.py` on macOS, `%USERPROFILE%\.slicerrc.py` on Windows). Deleting that block unloads it.
 
 ## Options (for the developers)
 
