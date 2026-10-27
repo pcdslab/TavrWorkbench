@@ -22,6 +22,8 @@ MODULE_DIR="$SOURCE_DIR/$MODULE_NAME"
 MARKER="$INSTALL_ROOT/slicer_app.txt"   # path of the Slicer.app this installer set up
 LOG="$INSTALL_ROOT/install.log"
 MIN_FREE_GB=4
+USER_APPS="$HOME/Applications"          # Slicer must be user-owned to save its settings
+OLD_SLICER_APP=""                       # set when an older install in /Applications was moved
 
 mkdir -p "$INSTALL_ROOT"
 exec > >(tee -a "$LOG") 2>&1
@@ -105,8 +107,23 @@ install_slicer() {
         local previous
         previous="$(cat "$MARKER")"
         if [ -x "$previous/Contents/MacOS/Slicer" ]; then
-            SLICER_APP="$previous"
-            say "Using the Slicer installed earlier: $SLICER_APP"
+            case "$previous" in
+                "$USER_APPS"/*)
+                    SLICER_APP="$previous"
+                    say "Using the Slicer installed earlier: $SLICER_APP"
+                    return 0
+                    ;;
+            esac
+            # Earlier installer versions used /Applications, where Slicer cannot save the module path.
+            local moved
+            moved="$USER_APPS/$(basename "$previous")"
+            say "Moving Slicer to $USER_APPS (Slicer cannot save its settings in /Applications)"
+            mkdir -p "$USER_APPS"
+            rm -rf "$moved"
+            ditto "$previous" "$moved" || die "Could not copy Slicer to $USER_APPS."
+            SLICER_APP="$moved"
+            OLD_SLICER_APP="$previous"
+            echo "$SLICER_APP" >"$MARKER"
             return 0
         fi
     fi
@@ -124,8 +141,10 @@ install_slicer() {
     case "$url" in http*) ;; *) url="https://download.slicer.org$url" ;; esac
     echo "Slicer $version"
 
-    local apps="/Applications"
-    if [ ! -w "$apps" ]; then apps="$HOME/Applications"; mkdir -p "$apps"; fi
+    # Always the user's own Applications folder: Slicer keeps its module-path settings inside
+    # Slicer.app, and macOS silently blocks those writes for apps in the shared /Applications.
+    local apps="$USER_APPS"
+    mkdir -p "$apps"
     local dest="$apps/Slicer.app"
     # Never overwrite a different Slicer the user already has
     if [ -e "$dest" ] && [ "$(plist_version "$dest")" != "$version" ]; then dest="$apps/Slicer $version.app"; fi
@@ -162,12 +181,12 @@ install_slicer() {
     echo "$SLICER_APP" >"$MARKER"
 }
 
-configure_slicer() {
-    say "Adding TavrWorkbench to Slicer (module path + Favorite modules)"
-    local result="$WORK/configure_result.txt" slicer_log="$WORK/configure_slicer.log"
-    TAVR_MODULE_DIR="$MODULE_DIR" TAVR_RESULT_FILE="$result" \
-        "$SLICER_APP/Contents/MacOS/Slicer" --no-splash --no-main-window --ignore-slicerrc \
-        --disable-cli-modules --disable-scripted-loadable-modules \
+run_slicer_script() {  # mode (configure|verify), extra Slicer arguments...
+    local mode="$1"; shift
+    local result="$WORK/${mode}_result.txt" slicer_log="$WORK/${mode}_slicer.log"
+    rm -f "$result"
+    TAVR_MODE="$mode" TAVR_MODULE_DIR="$MODULE_DIR" TAVR_RESULT_FILE="$result" \
+        "$SLICER_APP/Contents/MacOS/Slicer" --no-splash --no-main-window --ignore-slicerrc "$@" \
         --python-script "$SOURCE_DIR/install/configure_slicer.py" >"$slicer_log" 2>&1 &
     local pid=$! waited=0 grace=0
     # First start of Slicer can take a while; stop waiting 20 s after the result is written
@@ -183,12 +202,22 @@ configure_slicer() {
 
     if [ -s "$result" ] && head -n 1 "$result" | grep -q '^OK'; then
         tail -n +2 "$result"
-    else
-        echo "----- Slicer output -----"
-        cat "$slicer_log" 2>/dev/null || true
-        cat "$result" 2>/dev/null || true
-        die "Slicer could not be configured."
+        return 0
     fi
+    echo "----- Slicer output -----"
+    cat "$slicer_log" 2>/dev/null || true
+    echo "----- Result -----"
+    cat "$result" 2>/dev/null || echo "(Slicer did not report a result)"
+    return 1
+}
+
+configure_slicer() {
+    say "Adding TavrWorkbench to Slicer (module path + Favorite modules)"
+    run_slicer_script configure --disable-cli-modules --disable-scripted-loadable-modules \
+        || die "Slicer could not be configured."
+    say "Checking that TavrWorkbench loads in Slicer"
+    run_slicer_script verify --disable-cli-modules \
+        || die "TavrWorkbench was added to Slicer but does not load."
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -199,11 +228,15 @@ install_slicer
 configure_slicer
 
 say "Done. TavrWorkbench is ready."
-echo "Start Slicer from: $SLICER_APP"
+echo "Start Slicer from: $SLICER_APP  (also found with Spotlight: Cmd+Space, type Slicer)"
+if [ -n "$OLD_SLICER_APP" ]; then
+    echo "The old copy in $OLD_SLICER_APP is no longer used: drag it to the Trash to free space,"
+    echo "and use the Slicer in $USER_APPS from now on."
+fi
 echo "TavrWorkbench is in the Favorite modules toolbar (and under Modules > Examples)."
 echo "To update TavrWorkbench later, run the same install command again."
 
 answer="n"
-if read -r -p "Open Slicer now? [Y/n] " answer </dev/tty 2>/dev/null; then
+if read -r -p "Open Slicer now? [Y/n] " answer 2>/dev/null </dev/tty; then
     case "$answer" in [nN]*) ;; *) open "$SLICER_APP" ;; esac
 fi

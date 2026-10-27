@@ -121,14 +121,15 @@
         return $slicerExe
     }
 
-    function Set-SlicerConfiguration([string]$SlicerExe) {
-        Write-Step 'Adding TavrWorkbench to Slicer (module path + Favorite modules)'
-        $result = Join-Path $Work 'configure_result.txt'
+    function Invoke-SlicerScript([string]$SlicerExe, [string]$Mode, [string]$ExtraArgs) {
+        # Runs install\configure_slicer.py inside Slicer; returns the result text without the OK line
+        $result = Join-Path $Work "${Mode}_result.txt"
+        Remove-Item $result -ErrorAction SilentlyContinue
         $script = Join-Path $SourceDir 'install\configure_slicer.py'
+        $env:TAVR_MODE = $Mode
         $env:TAVR_MODULE_DIR = $ModuleDir
         $env:TAVR_RESULT_FILE = $result
-        $slicerArgs = "--no-splash --no-main-window --ignore-slicerrc --disable-cli-modules " +
-                      "--disable-scripted-loadable-modules --python-script `"$script`""
+        $slicerArgs = "--no-splash --no-main-window --ignore-slicerrc $ExtraArgs --python-script `"$script`""
         $proc = Start-Process -FilePath $SlicerExe -ArgumentList $slicerArgs -PassThru -WindowStyle Hidden
         # First start of Slicer can take a while; stop waiting 20 s after the result is written
         $waited = 0; $grace = 0
@@ -141,11 +142,20 @@
         Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
             Where-Object { $_.CommandLine -like '*configure_slicer.py*' } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-        Remove-Item Env:TAVR_MODULE_DIR, Env:TAVR_RESULT_FILE -ErrorAction SilentlyContinue
+        Remove-Item Env:TAVR_MODE, Env:TAVR_MODULE_DIR, Env:TAVR_RESULT_FILE -ErrorAction SilentlyContinue
 
-        $text = if (Test-Path $result) { Get-Content $result -Raw } else { '' }
-        if ($text -notmatch '^OK') { throw "Slicer could not be configured.`n$text" }
-        Write-Host (($text -split "`n" | Select-Object -Skip 1) -join "`n").Trim()
+        $text = if (Test-Path $result) { Get-Content $result -Raw } else { '(Slicer did not report a result)' }
+        if ($text -notmatch '^OK') { throw $text }
+        return (($text -split "`n" | Select-Object -Skip 1) -join "`n").Trim()
+    }
+
+    function Set-SlicerConfiguration([string]$SlicerExe) {
+        Write-Step 'Adding TavrWorkbench to Slicer (module path + Favorite modules)'
+        try { Write-Host (Invoke-SlicerScript $SlicerExe 'configure' '--disable-cli-modules --disable-scripted-loadable-modules') }
+        catch { throw "Slicer could not be configured.`n$($_.Exception.Message)" }
+        Write-Step 'Checking that TavrWorkbench loads in Slicer'
+        try { Write-Host (Invoke-SlicerScript $SlicerExe 'verify' '--disable-cli-modules') }
+        catch { throw "TavrWorkbench was added to Slicer but does not load.`n$($_.Exception.Message)" }
     }
 
     # ------------------------------------------------------------------------------------------
