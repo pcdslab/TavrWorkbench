@@ -25,7 +25,7 @@ from slicer.util import VTKObservationMixin
 
 from TavrWorkbenchLib.cases import (case_id_of, has_contours, has_measurements, is_file, is_image_path,
                                     measurement_rating_keys, read_data_map)
-from TavrWorkbenchLib.constants import (CASE_MASK_FILE, LOG_FILE, MASK_STATUS_TEXT,
+from TavrWorkbenchLib.constants import (CASE_MASK_FILE, LOG_FILE, MASK_STATUS_TEXT, MEAS_SEGMENTATION_OPACITY_3D,
                                         MEASUREMENT_KEY_TO_LABEL, MODE_MEASUREMENTS, MODE_SEGMENTATION, MODES,
                                         NOT_APPLICABLE_MARK, PENDING_MARK, RATING_ACCEPT, RATING_FLAG,
                                         RATING_TO_MARK, SEGMENTATION_LABELS, SELECTION_LABELS, SELECTIONS,
@@ -205,6 +205,9 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         ui.resetPlaneButton.connect("clicked()", self.meas.reset_plane)
         ui.alignViewButton.connect("clicked()", self.meas.align_view)
         ui.showAllHeightsCheck.connect("toggled(bool)", self.meas.set_show_all_heights)
+        ui.showSegOutlineCheck.setText("Segmentation (outline + 3D)")
+        ui.showSegOutlineCheck.setToolTip("Show the segmentation as an outline in the slice views and "
+                                          f"at {MEAS_SEGMENTATION_OPACITY_3D:.0%} opacity in the 3D view")
         ui.showSegOutlineCheck.connect("toggled(bool)", lambda _on: self._applySegmentationDisplay())
 
         self.measDecisionGroup = make_decision_group(ui.measApproveRadio, ui.measFlagRadio)
@@ -327,9 +330,16 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._standardViews()
 
     def _applySegmentationDisplay(self):
+        """Segmentation mode: normal display (3D opacity back to full).
+        Measurements mode: hidden, or - with the checkbox - outline in the slices + see-through 3D."""
         is_seg = self.mode == MODE_SEGMENTATION
-        self.seg.set_display(outline_only=not is_seg,
-                             visible=is_seg or bool(self.ui.showSegOutlineCheck.checked))
+        if is_seg:
+            self.seg.set_display(outline_only=False, visible=True, opacity_3d=None)
+            self.seg.set_opacity_3d(1.0)
+        else:
+            show = bool(self.ui.showSegOutlineCheck.checked)
+            self.seg.set_display(outline_only=True, visible=show,
+                                 opacity_3d=MEAS_SEGMENTATION_OPACITY_3D if show else None)
 
     def _standardViews(self):
         """Undo the contour-plane reformatting: four-up, axial / sagittal / coronal, fitted."""

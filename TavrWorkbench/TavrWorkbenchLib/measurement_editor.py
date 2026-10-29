@@ -2,8 +2,9 @@
 
 * The CONTOUR is the source of truth. Area, perimeter, max/min diameter and the two diameter
   lines are recomputed live every time a control point moves (Slicer's own point dragging).
-* One selection drives the views: ANNULUS / SOV / STJ -> single Red slice aligned to that
-  contour's plane (editable); STJ-H / LCH / RCH -> four-up with Green/Yellow long-axis planes
+* One selection drives the four-up view: Red always shows the active contour's plane (editable).
+  ANNULUS / SOV / STJ -> Green/Yellow = two perpendicular long-axis planes through the contour's
+  centre (shows the plane's position and tilt); STJ-H / LCH / RCH -> Green/Yellow = long-axis planes
   through the selected height point. Heights are read-only.
 * Hinge points, centerline points and .vtp models from the data map are loaded view-only.
 * While the module is in Segmentation mode every node here is shown (optionally) and locked.
@@ -430,9 +431,8 @@ class MeasurementEditor:
             n.SetDisplayVisibility(False)
 
     def _apply_layout(self):
-        L = slicer.vtkMRMLLayoutNode
-        layout = L.SlicerLayoutFourUpView if self.is_heights_view() else L.SlicerLayoutOneUpRedSliceView
-        slicer.app.layoutManager().setLayout(layout)
+        # Four-up for contours and heights alike: Red = contour plane, Green/Yellow = long axis, + 3D
+        slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
 
     def _align_soon(self):
         self.align_view()
@@ -458,6 +458,8 @@ class MeasurementEditor:
         self._set_fov(red, CONTOUR_FOV)
         if self.is_heights_view():
             self._align_height_views()
+        else:
+            self._align_contour_views()
 
     def _orient_slice(self, name, a, n, point):
         """Slice whose horizontal axis is `a` and vertical axis is `n`, through `point`."""
@@ -485,6 +487,23 @@ class MeasurementEditor:
         self._orient_slice("Yellow", b, n, p)
         try:
             slicer.app.layoutManager().threeDWidget(0).threeDView().setFocalPoint(float(p[0]), float(p[1]), float(p[2]))
+        except Exception:
+            pass
+
+    def _align_contour_views(self):
+        """Green/Yellow = two perpendicular long-axis planes through the active contour's centre; both
+        contain the contour's normal, so the contour shows up as a line across each view."""
+        c, u, v, n = self.cur["plane"]
+        n = unit(n)
+        fr = self.annulus_frame()
+        if fr is not None and np.dot(n, fr[3]) < 0:
+            n = -n  # keep "up the aortic root" pointing up in both views
+        a = unit(u - np.dot(u, n) * n)
+        b = unit(np.cross(n, a))
+        self._orient_slice("Green", a, n, c)
+        self._orient_slice("Yellow", b, n, c)
+        try:
+            slicer.app.layoutManager().threeDWidget(0).threeDView().setFocalPoint(float(c[0]), float(c[1]), float(c[2]))
         except Exception:
             pass
 

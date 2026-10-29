@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Build a portable TavrWorkbench dataset folder from a data map with absolute paths.
 
-Every file a case references is copied into  <out>/cases/<case_id>/...  and a new data_map.json with
+Every file a case references is copied into  <out>/cases/<case_id>/...  (the image and label are named
+after the case: <case_id>.nii.gz and <case_id>.seg.nrrd) and a new data_map.json with
 paths RELATIVE to itself is written next to it. The folder can then be shared (OneDrive, Google Drive,
 USB disk, zip) and opened from any location on macOS or Windows: in TavrWorkbench just select
 <out>/data_map.json as the data map.
@@ -12,7 +13,8 @@ USB disk, zip) and opened from any location on macOS or Windows: in TavrWorkbenc
     python3 tools/package_dataset.py  /Volumes/falcon/tavr_application/config/new_data_map_sorted.json  ~/TAVR_dataset --zip
     python3 tools/package_dataset.py /Users/khubaib/Downloads/review/measurement_corrections/new_data_map_sorted.json  /Volumes/falcon/TAVR_dataset_for_review --zip
 
-Re-running is safe: files already copied (same size) are skipped, so an interrupted run just continues.
+Re-running is safe: files already copied (same size) are skipped, so an interrupted run just continues,
+and files left in a case folder by an earlier run (e.g. under an old name) are removed.
 Only the Python standard library is used.
 """
 import argparse
@@ -74,6 +76,31 @@ def copy_file(src, dst):
     return size
 
 
+def referenced_paths(entry):
+    """Every relative file path a new data-map entry points to."""
+    paths = [entry[k] for k in FILE_KEYS if k in entry]
+    for group in GROUP_KEYS:
+        paths += list((entry.get(group) or {}).values())
+    return paths
+
+
+def remove_stale_files(out_dir, case_rel, entry):
+    """Delete files in this case's folder that the new map no longer references (left by an earlier
+    run, e.g. image.nii.gz / label.seg.nrrd from before the case-id naming). Returns how many."""
+    case_dir = os.path.join(out_dir, *case_rel.split("/"))
+    keep = {os.path.normcase(os.path.join(out_dir, *p.split("/"))) for p in referenced_paths(entry)}
+    removed = 0
+    for root, _dirs, files in os.walk(case_dir, topdown=False):
+        for name in files:
+            full = os.path.join(root, name)
+            if os.path.normcase(full) not in keep:
+                os.remove(full)
+                removed += 1
+        if root != case_dir and not os.listdir(root):
+            os.rmdir(root)
+    return removed
+
+
 def package(map_path, out_dir, cases=None):
     meta, samples = read_samples(map_path)
     out_dir = os.path.abspath(os.path.expanduser(out_dir))
@@ -102,7 +129,8 @@ def package(map_path, out_dir, cases=None):
 
         for key in FILE_KEYS:
             if sample.get(key):
-                rel = take(sample[key], key)
+                # image and label are named after the case: cases/500/500.nii.gz, cases/500/500.seg.nrrd
+                rel = take(sample[key], safe_name(cid))
                 if rel:
                     new[key] = rel
         for group in GROUP_KEYS:
@@ -116,8 +144,9 @@ def package(map_path, out_dir, cases=None):
                     copied[name] = rel
             if copied:
                 new[group] = copied
+        stale = remove_stale_files(out_dir, case_rel, new)
         new_samples.append(new)
-        print(f"  [{len(new_samples):3d}] case {cid}")
+        print(f"  [{len(new_samples):3d}] case {cid}" + (f"  (removed {stale} old file(s))" if stale else ""))
 
     # Only portable content goes into the new map ("dirs" etc. held machine-specific paths)
     out_meta = {k: v for k, v in meta.items() if k != "samples" and not isinstance(v, (list, dict))}
@@ -138,6 +167,8 @@ def make_zip(out_dir):
     with zipfile.ZipFile(zip_path, "w", allowZip64=True) as zf:
         for root, _dirs, files in os.walk(out_dir):
             for name in sorted(files):
+                if name.endswith(".part"):
+                    continue
                 full = os.path.join(root, name)
                 arc = os.path.join(base, os.path.relpath(full, out_dir)).replace(os.sep, "/")
                 method = zipfile.ZIP_STORED if name.lower().endswith(ALREADY_COMPRESSED) else zipfile.ZIP_DEFLATED

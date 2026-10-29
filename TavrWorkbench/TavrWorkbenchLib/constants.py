@@ -124,6 +124,7 @@ HEIGHT_NAMES = {"stj": "STJ height", "lch": "Left coronary (LCH)", "rch": "Right
 HEIGHT_COLORS = {"stj": (1.0, 0.3, 0.9), "lch": (0.2, 1.0, 1.0), "rch": (1.0, 0.5, 0.1)}
 CONTOUR_FOV = 70.0  # mm, contour-plane view
 HEIGHT_FOV = 90.0   # mm, long-axis height views
+MEAS_SEGMENTATION_OPACITY_3D = 0.25  # 3D segmentation opacity in Measurements mode ("Segmentation" box)
 # One radio group: contours first, then heights (selection key -> height key)
 SELECTIONS = ["annulus", "sov", "stj", "stj_h", "lch", "rch"]
 SELECTION_LABELS = {"annulus": "ANNULUS", "sov": "SOV", "stj": "STJ",

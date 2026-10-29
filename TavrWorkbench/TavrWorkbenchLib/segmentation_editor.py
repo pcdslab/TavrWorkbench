@@ -119,13 +119,31 @@ class SegmentationController:
         self.node = None
 
     # --------------------------------------------------------- display
-    def set_display(self, outline_only, visible):
+    def set_display(self, outline_only, visible, opacity_3d=None):
+        """outline_only: slice views show the outline without fill.
+        opacity_3d: also render the segmentation in the 3D view at this opacity (None = leave 3D as is)."""
         d = self.node.GetDisplayNode() if self.node else None
         if not d:
             return
         d.SetVisibility(bool(visible))
         d.SetVisibility2DFill(not outline_only)
         d.SetVisibility2DOutline(True)
+        if opacity_3d is not None and visible:
+            # The 3D view needs the closed-surface representation; it is built once per case
+            # (a few seconds for a large mask) and then reused.
+            if not self.node.GetSegmentation().ContainsRepresentation("Closed surface"):
+                slicer.app.setOverrideCursor(qt.Qt.WaitCursor)
+                try:
+                    self.node.CreateClosedSurfaceRepresentation()
+                finally:
+                    slicer.app.restoreOverrideCursor()
+            d.SetVisibility3D(True)
+            d.SetOpacity3D(float(opacity_3d))
+
+    def set_opacity_3d(self, opacity):
+        d = self.node.GetDisplayNode() if self.node else None
+        if d:
+            d.SetOpacity3D(float(opacity))
 
     def store_visibility(self):
         d = self.node.GetDisplayNode() if self.node else None
