@@ -2,14 +2,16 @@
 
 <output>/
     review_status.json            segmentation progress  {cid: {overall, time, mask_edited, mask_saved_at}}
-    correction_status.json        measurement progress   {cid: {status, time, planes_edited}}
+    correction_status.json        measurement progress   {cid: {status, time, planes_edited, heights_edited}}
     annotations.csv               one row per case: every Approve/Flag rating + comment
     corrected_measurements.csv    one row per case+plane: contour metrics
+    corrected_heights.csv         one row per case+height: heights above the (corrected) annulus plane
     tavr_workbench.log
     <case_id>/
         review.json               full review of the case (both modes)
         segmentation.seg.nrrd     edited mask (only after "Save mask")
         <plane>_contour.mrk.json  corrected contour (+ _max_d / _min_d diameter lines)
+        height_<key>.mrk.json     corrected height (stj / lch / rch; extra markups of the same file: _1, _2 ...)
 """
 import csv
 import json
@@ -17,7 +19,8 @@ import os
 from datetime import datetime
 
 from .constants import (ANNOTATION_COLUMNS, ANNOTATIONS_CSV, CASE_MASK_FILE, CASE_REVIEW_FILE,
-                        CONTOUR_FILE_SUFFIX, MEAS_STATUS_FILE, MEASUREMENT_COLUMNS, MEASUREMENTS_CSV,
+                        CONTOUR_FILE_SUFFIX, HEIGHT_COLUMNS, HEIGHT_FILE_PREFIX, HEIGHTS_CSV,
+                        MEAS_STATUS_FILE, MEASUREMENT_COLUMNS, MEASUREMENTS_CSV,
                         MEASUREMENT_KEY_TO_LABEL, RATING_NONE, RATING_TO_STR, SEG_STATUS_FILE,
                         SEGMENTATION_LABELS, normalize_rating, normalize_review)
 
@@ -98,6 +101,16 @@ class OutputStore:
             if os.path.isfile(p):
                 return p
         return None
+
+    def height_path(self, cid, key, part=0):
+        """Corrected height file. `part` > 0 is for extra markups that were stored in the same source file."""
+        suffix = f"_{part}" if part else ""
+        return self.case_path(cid, f"{HEIGHT_FILE_PREFIX}_{key}{suffix}.mrk.json")
+
+    def find_saved_height(self, cid, key, part=0):
+        """Corrected height from an earlier session, or None."""
+        path = self.height_path(cid, key, part) if self.root else ""
+        return path if path and os.path.isfile(path) else None
 
     def edited_mask_path(self, cid):
         p = self.case_path(cid, CASE_MASK_FILE)
@@ -215,3 +228,20 @@ class OutputStore:
             row = dict(m, case_id=cid, edited=m["plane"] in edited, saved_at=now_iso())
             rows[(cid, m["plane"])] = row
         _write_csv(path, MEASUREMENT_COLUMNS, rows.values())
+
+    def upsert_heights(self, cid, height_rows, dirty_heights):
+        """height_rows: [{height, height_mm, ...}] from MeasurementEditor.height_rows()."""
+        cid = str(cid)
+        entry = self.meas_status.setdefault(cid, {})
+        edited = list(entry.get("heights_edited", []))
+        for key in dirty_heights:
+            if key not in edited:
+                edited.append(key)
+        entry["heights_edited"] = edited
+        entry["time"] = now_iso()
+
+        path = self.path(HEIGHTS_CSV)
+        rows = _read_csv(path, lambda r: (r.get("case_id", ""), r.get("height", "")))
+        for h in height_rows:
+            rows[(cid, h["height"])] = dict(h, case_id=cid, edited=h["height"] in edited, saved_at=now_iso())
+        _write_csv(path, HEIGHT_COLUMNS, rows.values())

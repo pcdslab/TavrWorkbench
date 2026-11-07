@@ -6,7 +6,7 @@ One case list, two review modes:
 * Segmentation  - Approve / Flag the mask (overall + per label), edit it with the embedded
                   Segment Editor, save the edited mask. Measurements are shown locked for context.
 * Measurements  - correct Annulus / SOV / STJ contours with live area, perimeter and diameters,
-                  view STJ / coronary heights on long-axis planes, Approve / Flag (overall + per item).
+                  correct STJ / coronary heights on long-axis planes, Approve / Flag (overall + per item).
 
 Both modes share case navigation, the comment, Save / Save & Next and the output folder.
 Implementation lives in TavrWorkbenchLib/ (see its __init__.py for the module map).
@@ -203,6 +203,8 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         ui.resampleButton.connect("clicked()", lambda: self.meas.resample(ui.nPtsSpinBox.value))
         ui.resetPlaneButton.connect("clicked()", self.meas.reset_plane)
+        ui.resetPlaneButton.setToolTip("Restore the selected contour or height to its original from the data map")
+        ui.measEditGroupBox.setTitle("Contour / height editing")
         ui.alignViewButton.connect("clicked()", self.meas.align_view)
         ui.showAllHeightsCheck.connect("toggled(bool)", self.meas.set_show_all_heights)
         ui.showSegOutlineCheck.setText("Segmentation (outline + 3D)")
@@ -455,8 +457,8 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """Ask about unsaved contour edits. Returns False if the user cancels."""
         if not (self._case_loaded and self.meas.is_dirty()):
             return True
-        ans = qt.QMessageBox.question(slicer.util.mainWindow(), "Unsaved contour edits",
-                                      "Save contour edits for this case first?",
+        ans = qt.QMessageBox.question(slicer.util.mainWindow(), "Unsaved measurement edits",
+                                      "Save contour / height edits for this case first?",
                                       qt.QMessageBox.Yes | qt.QMessageBox.No | qt.QMessageBox.Cancel)
         if ans == qt.QMessageBox.Cancel:
             return False
@@ -532,7 +534,8 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             # Window/level is left exactly as Slicer loads the CT (no override).
             slicer.util.setSliceViewerLayers(background=self.volume_node, fit=False)
             self._loadSegmentation(sample, cid, label_path, from_saved_mask)
-            self.meas.load(sample, lambda plane: self.store.find_saved_contour(cid, plane))
+            self.meas.load(sample, lambda plane: self.store.find_saved_contour(cid, plane),
+                           lambda key, part: self.store.find_saved_height(cid, key, part))
         finally:
             lm.setRenderPaused(False)
             slicer.app.processEvents()
@@ -583,6 +586,9 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def _refreshMeasurementLabels(self):
         self.ui.metricsLabel.setText(self.meas.info_html())
         self.ui.heightsLabel.setText(self.meas.heights_html())
+        contour_selected = not self.meas.is_heights_view()  # Resample applies to contours only
+        self.ui.resampleButton.setEnabled(contour_selected)
+        self.ui.nPtsSpinBox.setEnabled(contour_selected)
 
     # ==================================================================
     # Ratings
@@ -641,27 +647,32 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         review = self._cacheReview()
         seg_decision = review["overall"]
         meas_decision = review["measurements_overall"]
-        contours_dirty = self.meas.is_dirty()
+        edits_dirty = self.meas.is_dirty()  # contours or heights
         if require_decision:
             decided = seg_decision if self.mode == MODE_SEGMENTATION else meas_decision
             if not decided:
                 slicer.util.warningDisplay(f"Please choose Approve or Flag for the {MODE_TITLES[self.mode]} "
                                            "before saving.")
                 return False
-        elif not (seg_decision or meas_decision or contours_dirty):
-            slicer.util.warningDisplay("Nothing to save yet: choose Approve or Flag, or edit a contour.")
+        elif not (seg_decision or meas_decision or edits_dirty):
+            slicer.util.warningDisplay("Nothing to save yet: choose Approve or Flag, or edit a contour or height.")
             return False
 
         cid = self.caseId()
         sample = self.samples[self.current_index]
         saved = []
         try:
-            if self.meas.has_contours() and (contours_dirty or meas_decision):
+            if (self.meas.has_contours() or self.meas.has_heights()) and (edits_dirty or meas_decision):
                 self.store.ensure_case_dir(cid)
-                self.meas.save_nodes(lambda plane, key: self.store.contour_path(cid, plane, key))
-                self.store.upsert_measurements(cid, self.meas.metrics_rows(), self.meas.dirty)
+                if self.meas.has_contours():
+                    self.meas.save_nodes(lambda plane, key: self.store.contour_path(cid, plane, key))
+                    self.store.upsert_measurements(cid, self.meas.metrics_rows(), self.meas.dirty)
+                    saved.append("contours")
+                if self.meas.has_heights():
+                    self.meas.save_heights(lambda key, part: self.store.height_path(cid, key, part))
+                    self.store.upsert_heights(cid, self.meas.height_rows(), self.meas.height_dirty)
+                    saved.append("heights")
                 self.meas.mark_saved()
-                saved.append("contours")
             if meas_decision:
                 self.store.set_meas_decision(cid, meas_decision)
             if seg_decision or cid in self.store.seg_status:

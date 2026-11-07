@@ -5,7 +5,11 @@
 * One selection drives the four-up view: Red always shows the active contour's plane (editable).
   ANNULUS / SOV / STJ -> Green/Yellow = two perpendicular long-axis planes through the contour's
   centre (shows the plane's position and tilt); STJ-H / LCH / RCH -> Green/Yellow = long-axis planes
-  through the selected height point. Heights are read-only.
+  through the selected height point.
+* Heights are edited like contours: the SELECTED height's points can be dragged (in any view, including
+  3D); its values above the annulus plane update live, Reset restores the original, and Save writes the
+  corrected height to the output folder (re-opened from there next time). All contours are locked
+  while a height is selected, and every height is locked while a contour is selected.
 * Hinge points, centerline points and .vtp models from the data map are loaded view-only.
 * While the module is in Segmentation mode every node here is shown (optionally) and locked.
 """
@@ -34,7 +38,8 @@ class MeasurementEditor:
         self.mode_active = False        # True while the module is in Measurements mode
         self.show_all_heights = True
         self.show_in_review = True      # visibility while in Segmentation mode
-        self._tags = []
+        self._tags = []          # observers on the active contour
+        self._height_tags = []   # observers on every height node
         self._guard = False
         self._reset()
 
@@ -48,6 +53,11 @@ class MeasurementEditor:
         self.orig_metrics = {}   # plane -> metrics of the original contour
         self.dirty = set()
         self.from_saved = set()
+        self.height_orig = {}        # height key -> [original points of each part]
+        self.height_dirty = set()    # heights edited since the last save
+        self.height_from_saved = set()
+        self._height_last = {}       # node id -> last known points (to ignore no-op events)
+        self._height_key_of = {}     # node id -> height key
         self.active_plane = None
         self.cur = None          # metrics of the active contour
         self._last = None
@@ -56,8 +66,16 @@ class MeasurementEditor:
     def has_contours(self):
         return bool(self.nodes)
 
+    def has_heights(self):
+        return bool(self.heights)
+
     def is_dirty(self):
-        return bool(self.dirty)
+        return bool(self.dirty or self.height_dirty)
+
+    def selected_height(self):
+        """Height key ("stj"/"lch"/"rch") being edited, or None while a contour is selected."""
+        key = HEIGHT_SEL.get(self.selection)
+        return key if key in self.heights else None
 
     def is_heights_view(self):
         return self.selection in HEIGHT_SEL
@@ -76,15 +94,15 @@ class MeasurementEditor:
         return out
 
     # ============================================================ loading
-    def load(self, sample, saved_contour_path=None):
-        """Create every measurement node of `sample`. saved_contour_path(plane) -> path of an earlier
-        correction (or None); when given, that correction replaces the original control points."""
+    def load(self, sample, saved_contour_path=None, saved_height_path=None):
+        """Create every measurement node of `sample`. saved_contour_path(plane) / saved_height_path(key, part)
+        -> path of an earlier correction (or None); when given, it replaces the original control points."""
         self.clear()
         self._guard = True
         try:
             for plane in PLANES:
                 self._load_plane(sample, plane, saved_contour_path)
-            self._load_heights(sample)
+            self._load_heights(sample, saved_height_path)
             self._load_extras(sample)
         finally:
             self._guard = False
@@ -161,7 +179,7 @@ class MeasurementEditor:
             added = [first] + [n for n in added if n.GetID() != first.GetID()]
         return (added[0] if added else None), added
 
-    def _load_heights(self, sample):
+    def _load_heights(self, sample, saved_height_path=None):
         for key in HEIGHTS:
             path = (sample.get("heights") or {}).get(key)
             if not is_file(path):
@@ -178,6 +196,18 @@ class MeasurementEditor:
                 self._style_height(part, key)
             self.heights[key] = node            # used for the height values
             self.height_parts[key] = parts      # everything the file added (shown / hidden together)
+            self.height_orig[key] = [self._get_pts(part).copy() for part in parts]
+            for i, part in enumerate(parts):
+                saved = saved_height_path(key, i) if saved_height_path else None
+                if saved:
+                    try:
+                        self._set_pts(part, read_mrk_points(saved))
+                        self.height_from_saved.add(key)
+                    except Exception as e:
+                        print(f"[TavrWorkbench] WARNING: could not read saved height {saved}: {e}")
+                self._height_key_of[part.GetID()] = key
+                self._height_last[part.GetID()] = self._get_pts(part)
+                self._attach_height(part)
 
     def _load_extras(self, sample):
         markups, models = collect_case_assets(sample)
@@ -225,6 +255,7 @@ class MeasurementEditor:
     def clear(self):
         """Remove every node of the current case from the scene."""
         self._detach()
+        self._detach_heights()
         for node in self.all_nodes():
             try:
                 slicer.mrmlScene.RemoveNode(node)
@@ -235,6 +266,7 @@ class MeasurementEditor:
     def forget(self):
         """The scene is being closed: drop node references without touching the scene."""
         self._detach()
+        self._detach_heights()
         self._reset()
 
     # ============================================================ styling
@@ -338,6 +370,33 @@ class MeasurementEditor:
                 pass
         self._tags = []
 
+    def _attach_height(self, node):
+        ev = slicer.vtkMRMLMarkupsNode
+        self._height_tags.append((node, node.AddObserver(ev.PointModifiedEvent, self._on_height_modified)))
+        self._height_tags.append((node, node.AddObserver(ev.PointEndInteractionEvent, self._on_height_modified)))
+
+    def _detach_heights(self):
+        for node, tag in self._height_tags:
+            try:
+                node.RemoveObserver(tag)
+            except Exception:
+                pass
+        self._height_tags = []
+
+    def _on_height_modified(self, caller, event):
+        if self._guard:
+            return
+        key = self._height_key_of.get(caller.GetID())
+        if key is None:
+            return
+        cur = self._get_pts(caller)
+        last = self._height_last.get(caller.GetID())
+        if last is not None and cur.shape == last.shape and np.allclose(cur, last, atol=1e-6):
+            return  # nothing actually moved
+        self._height_last[caller.GetID()] = cur
+        self.height_dirty.add(key)
+        self._notify()
+
     def _activate_plane(self, plane):
         self._detach()
         self.active_plane = plane
@@ -417,12 +476,15 @@ class MeasurementEditor:
             active = plane == self.active_plane
             for n in nodes.values():
                 n.SetDisplayVisibility(active or heights_view)
-            nodes["curve"].SetLocked(not active)
+            # only the active contour is editable, and only while a contour is selected
+            nodes["curve"].SetLocked(not active or heights_view)
         sel_height = HEIGHT_SEL.get(self.selection)
         all_heights = not heights_view or self.show_all_heights
         for key, parts in self.height_parts.items():
             for n in parts:
                 n.SetDisplayVisibility(all_heights or key == sel_height)
+                # only the selected height is editable
+                n.SetLocked(not (heights_view and key == sel_height))
         # Centerline (points, curve, surface) belongs to segmentation review only;
         # hinge points are shown for context in the heights view.
         for group, n in self.extras:
@@ -528,8 +590,8 @@ class MeasurementEditor:
 
     # ============================================================ actions
     def resample(self, n_points):
-        if self.active_plane is None:
-            return
+        if self.active_plane is None or self.is_heights_view():
+            return  # contours only
         curve = self.nodes[self.active_plane]["curve"]
         new = resample_closed(self._dense_pts(curve), n_points)
         self._set_pts(curve, new)
@@ -541,6 +603,12 @@ class MeasurementEditor:
         self._refresh(mark=True)
 
     def reset_plane(self):
+        """Reset what is selected: the selected height, or the active contour."""
+        if self.is_heights_view():
+            key = self.selected_height()
+            if key is not None:
+                self.reset_height(key)
+            return
         p = self.active_plane
         if p is None:
             return
@@ -548,6 +616,15 @@ class MeasurementEditor:
         self._last = self.orig[p].copy()
         self.dirty.discard(p)
         self._refresh(mark=False)
+
+    def reset_height(self, key):
+        """Restore a height's original points from the data map."""
+        for part, pts in zip(self.height_parts.get(key, []), self.height_orig.get(key, [])):
+            self._set_pts(part, pts)
+            self._height_last[part.GetID()] = pts.copy()
+        self.height_dirty.discard(key)
+        self.height_from_saved.discard(key)
+        self._notify()
 
     # ============================================================ saving
     def save_nodes(self, path_for):
@@ -573,8 +650,45 @@ class MeasurementEditor:
             })
         return rows
 
+    def save_heights(self, path_for):
+        """Write every height (all parts of its file); path_for(key, part) -> file path."""
+        for key, parts in self.height_parts.items():
+            for i, part in enumerate(parts):
+                path = path_for(key, i)
+                if not slicer.util.saveNode(part, path):
+                    raise IOError(f"could not save height {key} to {path}")
+
+    def _height_values(self, key, frame):
+        """(per-point heights above the annulus plane, line length or None) for one height."""
+        c, u, v, n = frame
+        pts = self._get_pts(self.heights[key])
+        h = (pts - c) @ n
+        length = float(np.linalg.norm(pts[1] - pts[0])) if len(pts) == 2 else None
+        return h, length
+
+    def height_rows(self):
+        """One row per height: height_mm = highest point above the current annulus plane."""
+        frame = self.annulus_frame()
+        rows = []
+        if frame is None:
+            return rows
+        for key in HEIGHTS:
+            node = self.heights.get(key)
+            if node is None or node.GetNumberOfControlPoints() == 0:
+                continue
+            h, length = self._height_values(key, frame)
+            rows.append({
+                "height": key,
+                "height_mm": round(float(np.max(h)), 2),
+                "point_heights_mm": ";".join(f"{x:.2f}" for x in h),
+                "line_length_mm": round(length, 2) if length is not None else "",
+                "n_points": int(len(h)),
+            })
+        return rows
+
     def mark_saved(self):
         self.dirty.clear()
+        self.height_dirty.clear()
         self._notify()
 
     # ============================================================ panel text
@@ -599,22 +713,28 @@ class MeasurementEditor:
             return ""
         if not self.heights:
             return "<i>No height files for this case.</i>"
-        c, u, v, n = fr
         html = ("<b>HEIGHTS</b> <span style='color:#888'>(above current annulus plane, mm)</span>"
-                "<table cellpadding=3><tr><td></td><td><b>height</b></td><td><b>line length</b></td></tr>")
+                "<table cellpadding=3><tr><td></td><td><b>height</b></td><td><b>line length</b></td>"
+                "<td></td></tr>")
+        selected = self.selected_height()
         for key in HEIGHTS:
             node = self.heights.get(key)
             if node is None or node.GetNumberOfControlPoints() == 0:
                 continue
-            pts = self._get_pts(node)
-            h = (pts - c) @ n
-            if len(pts) == 2:
+            h, length = self._height_values(key, fr)
+            if length is not None:
                 htxt = f"{h[0]:.1f} → {h[1]:.1f} (Δ {abs(h[1] - h[0]):.1f})"
-                ltxt = f"{np.linalg.norm(pts[1] - pts[0]):.1f}"
+                ltxt = f"{length:.1f}"
             else:
                 htxt = ", ".join(f"{x:.1f}" for x in h)
                 ltxt = "–"
             col = "#%02x%02x%02x" % tuple(int(255 * x) for x in HEIGHT_COLORS[key])
-            html += (f"<tr><td><span style='color:{col}'>●</span> {HEIGHT_NAMES[key]}</td>"
-                     f"<td>{htxt}</td><td>{ltxt}</td></tr>")
+            name = f"<b>{HEIGHT_NAMES[key]}</b>" if key == selected else HEIGHT_NAMES[key]
+            state = ""
+            if key in self.height_dirty:
+                state = "<span style='color:#c60'>edited</span>"
+            elif key in self.height_from_saved:
+                state = "<i>saved correction</i>"
+            html += (f"<tr><td><span style='color:{col}'>●</span> {name}</td>"
+                     f"<td>{htxt}</td><td>{ltxt}</td><td>{state}</td></tr>")
         return html + "</table>"

@@ -101,6 +101,7 @@ SEG_STATUS_FILE = "review_status.json"         # segmentation review progress
 MEAS_STATUS_FILE = "correction_status.json"    # measurement review / correction progress
 ANNOTATIONS_CSV = "annotations.csv"            # one row per case: all Approve/Flag ratings
 MEASUREMENTS_CSV = "corrected_measurements.csv"  # one row per case + plane: contour metrics
+HEIGHTS_CSV = "corrected_heights.csv"          # one row per case + height: heights above the annulus plane
 CASE_REVIEW_FILE = "review.json"
 CASE_MASK_FILE = "segmentation.seg.nrrd"
 LOG_FILE = "tavr_workbench.log"
@@ -110,6 +111,8 @@ ANNOTATION_COLUMNS = (["case_id", "file", "comment", "mask_path", "mask_status",
                       + ["saved_at"])
 MEASUREMENT_COLUMNS = ["case_id", "plane", "edited", "area_mm2", "perimeter_mm", "max_d_mm", "min_d_mm",
                        "mean_d_mm", "eccentricity", "n_control_pts", "saved_at"]
+HEIGHT_COLUMNS = ["case_id", "height", "edited", "height_mm", "point_heights_mm", "line_length_mm",
+                  "n_points", "saved_at"]
 
 MASK_STATUS_TEXT = {0: "No mask found", 1: "Cannot load mask", 2: "Mask loaded, no edits", 3: "Mask edited"}
 
@@ -117,6 +120,7 @@ MASK_STATUS_TEXT = {0: "No mask found", 1: "Cannot load mask", 2: "Mask loaded, 
 # Measurement editor
 # ---------------------------------------------------------------------------
 CONTOUR_FILE_SUFFIX = {"curve": "contour", "max": "max_d", "min": "min_d"}
+HEIGHT_FILE_PREFIX = "height"  # corrected heights: <output>/<case>/height_<key>.mrk.json (+ _1, _2 ... extra parts)
 PLANES = ["annulus", "sov", "stj"]
 PLANE_COLORS = {"annulus": (1.0, 0.8, 0.0), "sov": (0.2, 0.9, 0.4), "stj": (0.3, 0.7, 1.0)}
 HEIGHTS = ["stj", "lch", "rch"]
