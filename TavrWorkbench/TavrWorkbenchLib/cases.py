@@ -2,8 +2,10 @@
 import json
 import os
 
+import glob
+
 from .constants import (IMAGE_EXTENSIONS, MARKUP_EXTENSIONS, MARKUP_GROUP_KEYS, MEASUREMENT_KEY_TO_LABEL,
-                        MODEL_EXTENSIONS, PLANES)
+                        MODEL_EXTENSIONS, PLANES, REFERENCE_POINT_GROUPS)
 
 
 def is_file(path):
@@ -32,10 +34,43 @@ def resolve_sample_paths(sample, base_dir):
     for key in ("image", "label"):
         if key in out:
             out[key] = _resolve(out[key], base_dir)
-    for group in MARKUP_GROUP_KEYS:
+    for group in list(MARKUP_GROUP_KEYS) + list(REFERENCE_POINT_GROUPS) + ["dirs"]:
         if isinstance(out.get(group), dict):
             out[group] = {name: _resolve(p, base_dir) for name, p in out[group].items()}
     return out
+
+
+def _find_letter_file(folder, letter):
+    """L / R / N point file in a folder (L.mrk.json, l_hinge.mrk.json ...), as in the STJ height script."""
+    if not (isinstance(folder, str) and os.path.isdir(folder)):
+        return None
+    candidates = sorted(glob.glob(os.path.join(folder, "*.mrk.json"))) or \
+        sorted(glob.glob(os.path.join(folder, "*.json")))
+    low = letter.lower()
+    for path in candidates:
+        name = os.path.basename(path).lower().split(".")[0]
+        if name == low or name.startswith(low + "_") or name.startswith(low + "-"):
+            return path
+    for path in candidates:
+        if low in os.path.basename(path).lower().replace("-", "_").replace(".", "_").split("_"):
+            return path
+    return None
+
+
+def reference_points(sample, group):
+    """{letter: path} of the STJ points ("stj_points": L, R, N) or coronary ostia
+    ("coronary_ostia_points": L, R): from the sample's own group, else from its "dirs" folder."""
+    letters = REFERENCE_POINT_GROUPS[group]
+    explicit = sample.get(group) if isinstance(sample.get(group), dict) else {}
+    folder = (sample.get("dirs") or {}).get(group)
+    found = {}
+    for letter in letters:
+        path = explicit.get(letter)
+        if not is_file(path):
+            path = _find_letter_file(folder, letter)
+        if is_file(path):
+            found[letter] = path
+    return found
 
 
 def read_data_map(path):

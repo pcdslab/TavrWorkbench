@@ -10,7 +10,9 @@
   3D); its values above the annulus plane update live, Reset restores the original, and Save writes the
   corrected height to the output folder (re-opened from there next time). All contours are locked
   while a height is selected, and every height is locked while a contour is selected.
-* Hinge points, centerline points and .vtp models from the data map are loaded view-only.
+* Hinge points, centerline points and .vtp models from the data map are loaded view-only, except in
+  the Annular Plane tab (plane_mode), where only the three hinge points are editable and the annulus
+  contour, its diameters and the heights are shown locked for reference.
 * While the module is in Segmentation mode every node here is shown (optionally) and locked.
 """
 import numpy as np
@@ -19,7 +21,7 @@ import slicer
 from vtk.util.numpy_support import vtk_to_numpy
 
 from .cases import collect_case_assets, is_file
-from .constants import (CONTOUR_FOV, EDITOR_GROUP_KEYS, HEIGHT_COLORS, HEIGHT_FOV, HEIGHT_NAMES, HEIGHT_SEL,
+from .constants import (CONTOUR_FOV, EDITOR_GROUP_KEYS, HINGE_COLORS, HINGE_KEYS, HEIGHT_COLORS, HEIGHT_FOV, HEIGHT_NAMES, HEIGHT_SEL,
                         HEIGHTS, PLANE_COLORS, PLANES, SELECTIONS)
 from .geometry import compute_metrics, read_mrk_points, resample_closed, unit
 
@@ -36,10 +38,13 @@ class MeasurementEditor:
         self._on_update = on_update
         self.selection = PLANES[0]
         self.mode_active = False        # True while the module is in Measurements mode
+        self.plane_mode = False         # True while the module is in the Annular Plane tab
+        self.on_hinge_moved = None      # callback for the Annular Plane panel
         self.show_all_heights = True
         self.show_in_review = True      # visibility while in Segmentation mode
         self._tags = []          # observers on the active contour
         self._height_tags = []   # observers on every height node
+        self._hinge_tags = []    # observers on the hinge points
         self._guard = False
         self._reset()
 
@@ -48,6 +53,8 @@ class MeasurementEditor:
         self.heights = {}        # height key -> main markups node (used for the height values)
         self.height_parts = {}   # height key -> every node its file added (incl. the main one)
         self.extras = []         # (group, node): view-only hinge points / centerline markups and models
+        self.hinges = {}         # "LCC"/"RCC"/"NCC" -> hinge point node
+        self.hinge_loaded = {}   # hinge key -> position (RAS) when the case was loaded
         self.stray = []          # extra nodes found inside contour files (always hidden)
         self.orig = {}           # plane -> original control points
         self.orig_metrics = {}   # plane -> metrics of the original contour
@@ -227,6 +234,13 @@ class MeasurementEditor:
                 self._slice_intersections(node.GetDisplayNode())
                 node.SetLocked(True)
                 self.extras.append((group, node))
+                hinge = key.split(".", 1)[1] if group == "hinge_points" else None
+                if i == 0 and hinge in HINGE_KEYS and node.GetNumberOfControlPoints() > 0:
+                    self._style_hinge(node, hinge)
+                    self.hinges[hinge] = node
+                    self.hinge_loaded[hinge] = self._get_pts(node)[0].copy()
+                    self._hinge_tags.append(
+                        (node, node.AddObserver(slicer.vtkMRMLMarkupsNode.PointModifiedEvent, self._on_hinge_modified)))
 
         for key, path in models.items():
             try:
@@ -256,6 +270,7 @@ class MeasurementEditor:
         """Remove every node of the current case from the scene."""
         self._detach()
         self._detach_heights()
+        self._detach_hinges()
         for node in self.all_nodes():
             try:
                 slicer.mrmlScene.RemoveNode(node)
@@ -267,6 +282,7 @@ class MeasurementEditor:
         """The scene is being closed: drop node references without touching the scene."""
         self._detach()
         self._detach_heights()
+        self._detach_hinges()
         self._reset()
 
     # ============================================================ styling
@@ -289,6 +305,21 @@ class MeasurementEditor:
         d.SetPropertiesLabelVisibility(False)
         d.SetGlyphScale(1.6)
         d.SetLineThickness(thickness)
+
+    @staticmethod
+    def _style_hinge(node, key):
+        d = node.GetDisplayNode()
+        d.SetSelectedColor(*HINGE_COLORS[key])
+        d.SetColor(*HINGE_COLORS[key])
+        d.SetGlyphScale(2.5)
+        d.SetTextScale(3.0)
+        d.SetPointLabelsVisibility(True)
+        d.SetPropertiesLabelVisibility(False)
+        node.SetNthControlPointLabel(0, key)
+        try:  # visible in slice views even when slightly off-plane (Slicer >= 5)
+            d.SetSliceDisplayModeToProjection()
+        except Exception:
+            pass
 
     @staticmethod
     def _style_height(node, key):
@@ -397,6 +428,50 @@ class MeasurementEditor:
         self.height_dirty.add(key)
         self._notify()
 
+    def _detach_hinges(self):
+        for node, tag in self._hinge_tags:
+            try:
+                node.RemoveObserver(tag)
+            except Exception:
+                pass
+        self._hinge_tags = []
+
+    def _on_hinge_modified(self, caller, event):
+        if self.on_hinge_moved:
+            try:
+                self.on_hinge_moved()
+            except Exception as e:
+                print(f"[TavrWorkbench] WARNING: annular plane panel update failed: {e}")
+
+    # ============================================================ hinge points (Annular Plane tab)
+    def has_hinges(self):
+        return all(k in self.hinges for k in HINGE_KEYS)
+
+    def hinge_points_lps(self, loaded=False):
+        """{"LCC"/"RCC"/"NCC": LPS position}: current positions, or as loaded with the case."""
+        flip = np.array([-1.0, -1.0, 1.0])
+        if loaded:
+            return {k: p * flip for k, p in self.hinge_loaded.items()}
+        return {k: self._get_pts(n)[0] * flip for k, n in self.hinges.items()}
+
+    def hinge_moves_mm(self):
+        """How far each hinge point has been dragged since the case was loaded (mm)."""
+        return {k: float(np.linalg.norm(self._get_pts(n)[0] - self.hinge_loaded[k]))
+                for k, n in self.hinges.items()}
+
+    def hinges_moved(self, tol_mm=1e-3):
+        return any(d > tol_mm for d in self.hinge_moves_mm().values())
+
+    def reset_hinges(self):
+        for k, node in self.hinges.items():
+            p = self.hinge_loaded[k]
+            node.SetNthControlPointPositionWorld(0, float(p[0]), float(p[1]), float(p[2]))
+        self._on_hinge_modified(None, None)
+
+    def set_plane_mode(self, active):
+        self.plane_mode = bool(active)
+        self.apply_visibility()
+
     def _activate_plane(self, plane):
         self._detach()
         self.active_plane = plane
@@ -463,6 +538,11 @@ class MeasurementEditor:
         self._notify()
 
     def apply_visibility(self):
+        if self.plane_mode:
+            self._apply_plane_mode_visibility()
+            return
+        for n in self.hinges.values():
+            n.SetLocked(True)  # hinge points are only editable in the Annular Plane tab
         if not self.mode_active:
             # Segmentation review: everything (incl. centerline) for context, all locked
             for n in self.all_nodes():
@@ -489,6 +569,25 @@ class MeasurementEditor:
         # hinge points are shown for context in the heights view.
         for group, n in self.extras:
             n.SetDisplayVisibility(heights_view and group != "centerline")
+        for n in self.stray:
+            n.SetDisplayVisibility(False)
+
+    def _apply_plane_mode_visibility(self):
+        """Annular Plane tab: hinge points editable; annulus contour, diameters, heights shown locked."""
+        hinge_nodes = set(self.hinges.values())
+        for plane, nodes in self.nodes.items():
+            for n in nodes.values():
+                n.SetDisplayVisibility(plane == "annulus")
+                if _is_markups(n):
+                    n.SetLocked(True)
+        for parts in self.height_parts.values():
+            for n in parts:
+                n.SetDisplayVisibility(True)
+                n.SetLocked(True)
+        for group, n in self.extras:
+            n.SetDisplayVisibility(n in hinge_nodes)
+            if _is_markups(n):
+                n.SetLocked(n not in hinge_nodes)
         for n in self.stray:
             n.SetDisplayVisibility(False)
 

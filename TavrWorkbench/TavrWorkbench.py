@@ -7,6 +7,8 @@ One case list, two review modes:
                   Segment Editor, save the edited mask. Measurements are shown locked for context.
 * Measurements  - correct Annulus / SOV / STJ contours with live area, perimeter and diameters,
                   correct STJ / coronary heights on long-axis planes, Approve / Flag (overall + per item).
+* Annular Plane - correct the LCC / RCC / NCC hinge points; Apply backs up the current files and
+                  regenerates the annulus contour, its diameters and the STJ / coronary heights.
 
 Both modes share case navigation, the comment, Save / Save & Next and the output folder.
 Implementation lives in TavrWorkbenchLib/ (see its __init__.py for the module map).
@@ -26,10 +28,12 @@ from slicer.util import VTKObservationMixin
 from TavrWorkbenchLib.cases import (case_id_of, has_contours, has_measurements, is_file, is_image_path,
                                     measurement_rating_keys, read_data_map)
 from TavrWorkbenchLib.constants import (CASE_MASK_FILE, LOG_FILE, MASK_STATUS_TEXT, MEAS_SEGMENTATION_OPACITY_3D,
-                                        MEASUREMENT_KEY_TO_LABEL, MODE_MEASUREMENTS, MODE_SEGMENTATION, MODES,
+                                        MEASUREMENT_KEY_TO_LABEL, MODE_MEASUREMENTS, MODE_PLANE, MODE_SEGMENTATION,
+                                        MODES,
                                         NOT_APPLICABLE_MARK, PENDING_MARK, RATING_ACCEPT, RATING_FLAG,
                                         RATING_TO_MARK, SEGMENTATION_LABELS, SELECTION_LABELS, SELECTIONS,
                                         SHORTCUT_ACCEPT, SHORTCUT_FLAG)
+from TavrWorkbenchLib.annular_plane import AnnularPlanePanel
 from TavrWorkbenchLib.measurement_editor import MeasurementEditor
 from TavrWorkbenchLib.rating_table import (RatingTable, group_rating, make_decision_group, set_group_rating,
                                            uncheck_group)
@@ -39,7 +43,9 @@ from TavrWorkbenchLib.storage import OutputStore
 # Suppress VTK warnings globally to prevent console flooding and UI freezing
 vtk.vtkObject.GlobalWarningDisplayOff()
 
-MODE_TITLES = {MODE_SEGMENTATION: "segmentation", MODE_MEASUREMENTS: "measurements"}
+MODE_TITLES = {MODE_SEGMENTATION: "segmentation", MODE_MEASUREMENTS: "measurements",
+               MODE_PLANE: "annular plane"}
+PLANE_FIXED_MARK = " ⟳"   # case list: the annular plane of this case has been fixed
 
 
 class TavrWorkbench(ScriptedLoadableModule):
@@ -140,6 +146,10 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.measItemsCollapsibleButton.setVisible(False)
         self.seg = SegmentationController(self.ui.segEditorContainer)
         self.meas = MeasurementEditor(on_update=self._refreshMeasurementLabels)
+        self.plane = AnnularPlanePanel(self)
+        self.meas.on_hinge_moved = self.plane.refresh
+        main_layout = uiWidget.layout()
+        main_layout.insertWidget(main_layout.indexOf(self.ui.measPanel) + 1, self.plane.widget)
 
         self._setupCaseSection()
         self._setupModeSwitch()
@@ -176,6 +186,12 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.modeGroup.setExclusive(True)
         self.modeGroup.addButton(self.ui.segModeButton, 0)
         self.modeGroup.addButton(self.ui.measModeButton, 1)
+        self.planeModeButton = qt.QPushButton("Annular Plane")
+        self.planeModeButton.setCheckable(True)
+        self.planeModeButton.setToolTip("Correct the hinge points; Apply regenerates the annulus contour, "
+                                        "diameters and heights (previous files are backed up)")
+        self.ui.modeWidget.layout().addWidget(self.planeModeButton)
+        self.modeGroup.addButton(self.planeModeButton, 2)
         self.modeGroup.connect("buttonClicked(int)", lambda i: self._setMode(MODES[i]))
 
     def _setupSegmentationPanel(self):
@@ -250,6 +266,11 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def _caseHasMeasurements(self, idx):
         return 0 <= idx < len(self.case_flags) and self.case_flags[idx][0]
 
+    def _reviewMode(self, mode=None):
+        """Mode whose Approve / Flag progress applies: the Annular Plane tab follows Measurements."""
+        mode = mode or self.mode
+        return MODE_MEASUREMENTS if mode == MODE_PLANE else mode
+
     def _isReviewed(self, idx, mode):
         cid = self.caseId(idx)
         if mode == MODE_SEGMENTATION:
@@ -257,12 +278,13 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         return bool(self.store.meas_rating(cid))
 
     def _needsReview(self, idx, mode):
+        mode = self._reviewMode(mode)
         if mode == MODE_MEASUREMENTS and not self._caseHasMeasurements(idx):
             return False
         return not self._isReviewed(idx, mode)
 
     def _decisionWidgets(self, mode=None):
-        mode = mode or self.mode
+        mode = self._reviewMode(mode)
         if mode == MODE_SEGMENTATION:
             return self.segDecisionGroup, self.ui.segApproveRadio, self.ui.segFlagRadio
         return self.measDecisionGroup, self.ui.measApproveRadio, self.ui.measFlagRadio
@@ -290,7 +312,8 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 meas_mark = RATING_TO_MARK.get(self.store.meas_rating(cid), PENDING_MARK)
             else:
                 meas_mark = NOT_APPLICABLE_MARK
-            combo.addItem(f"{seg_mark}{meas_mark}  {cid}")
+            fixed = PLANE_FIXED_MARK if self.store.plane_fix_version(cid) else ""
+            combo.addItem(f"{seg_mark}{meas_mark}  {cid}{fixed}")
         if 0 <= self.current_index < combo.count:
             combo.setCurrentIndex(self.current_index)
         combo.blockSignals(False)
@@ -315,17 +338,28 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.mode = mode
         is_seg = mode == MODE_SEGMENTATION
         self.ui.segModeButton.setChecked(is_seg)
-        self.ui.measModeButton.setChecked(not is_seg)
+        self.ui.measModeButton.setChecked(mode == MODE_MEASUREMENTS)
+        self.planeModeButton.setChecked(mode == MODE_PLANE)
         self.ui.segPanel.setVisible(is_seg)
-        self.ui.measPanel.setVisible(not is_seg)
+        self.ui.measPanel.setVisible(mode == MODE_MEASUREMENTS)
+        self.plane.widget.setVisible(mode == MODE_PLANE)
         if not is_seg:
             self.seg.deactivate_effect()  # no accidental painting while dragging contour points
         self._applyModeToScene()
 
     def _applyModeToScene(self):
         measuring = self.mode == MODE_MEASUREMENTS and self.meas.has_contours()
+        planing = self.mode == MODE_PLANE and self._case_loaded
         self._applySegmentationDisplay()
+        self.meas.set_plane_mode(self.mode == MODE_PLANE)
         self.meas.set_mode_active(self.mode == MODE_MEASUREMENTS)
+        if planing:
+            self.plane.enter()
+            self._views_reformatted = True
+        elif self.mode == MODE_PLANE:
+            self.plane.refresh()
+        if self.mode != MODE_PLANE:
+            self.plane.leave()  # restore the crosshair / slice-intersection settings
         if measuring:
             self._views_reformatted = True
         elif self._views_reformatted:
@@ -333,11 +367,16 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def _applySegmentationDisplay(self):
         """Segmentation mode: normal display (3D opacity back to full).
-        Measurements mode: hidden, or - with the checkbox - outline in the slices + see-through 3D."""
+        Measurements / Annular Plane: hidden, or - with the tab's checkbox - outline in the slices +
+        see-through 3D (MEAS_SEGMENTATION_OPACITY_3D)."""
         is_seg = self.mode == MODE_SEGMENTATION
         if is_seg:
             self.seg.set_display(outline_only=False, visible=True, opacity_3d=None)
             self.seg.set_opacity_3d(1.0)
+        elif self.mode == MODE_PLANE:
+            show = self.plane.show_segmentation()
+            self.seg.set_display(outline_only=True, visible=show,
+                                 opacity_3d=MEAS_SEGMENTATION_OPACITY_3D if show else None)
         else:
             show = bool(self.ui.showSegOutlineCheck.checked)
             self.seg.set_display(outline_only=True, visible=show,
@@ -356,7 +395,7 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._views_reformatted = False
 
     def _onDecisionShortcut(self, rating):
-        if not self.parent.isEntered or not self._case_loaded:
+        if not self.parent.isEntered or not self._case_loaded or self.mode == MODE_PLANE:
             return
         _group, approve, flag = self._decisionWidgets()
         if approve.enabled:
@@ -451,10 +490,14 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             j = (self.current_index + k) % n
             if self._needsReview(j, self.mode):
                 return self.loadCase(j)
-        slicer.util.infoDisplay(f"All cases have been reviewed for {MODE_TITLES[self.mode]}.")
+        slicer.util.infoDisplay(f"All cases have been reviewed for {MODE_TITLES[self._reviewMode()]}.")
 
     def _confirmLeaveCase(self):
-        """Ask about unsaved contour edits. Returns False if the user cancels."""
+        """Ask about unapplied hinge moves / unsaved contour edits. Returns False if the user cancels."""
+        if self._case_loaded and self.meas.hinges_moved():
+            if not slicer.util.confirmOkCancelDisplay(
+                    "The hinge points were moved but not applied (Annular Plane tab). Discard these moves?"):
+                return False
         if not (self._case_loaded and self.meas.is_dirty()):
             return True
         ans = qt.QMessageBox.question(slicer.util.mainWindow(), "Unsaved measurement edits",
@@ -512,9 +555,22 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return label, False
         return "", False
 
+    def _effectiveSample(self, idx):
+        """Data-map sample with this case's regenerated Annular Plane files substituted, if any."""
+        return self.store.effective_sample(self.samples[idx], self.caseId(idx))
+
+    def _reloadMeasurementNodes(self):
+        """Re-create the measurement nodes (after an Annular Plane Apply) without reloading CT / mask."""
+        cid = self.caseId()
+        self.meas.load(self._effectiveSample(self.current_index),
+                       lambda plane: self.store.find_saved_contour(cid, plane),
+                       lambda key, part: self.store.find_saved_height(cid, key, part))
+        self._updateMeasurementPanel()
+        self._applyModeToScene()
+
     def _loadCaseData(self):
         self._clearCaseNodes()
-        sample = self.samples[self.current_index]
+        sample = self._effectiveSample(self.current_index)
         cid = self.caseId()
         image_path = sample.get("image", "")
         print(f"[TavrWorkbench] Loading case {cid} ({self.current_index + 1}/{len(self.samples)}): {image_path}")
@@ -649,9 +705,9 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         meas_decision = review["measurements_overall"]
         edits_dirty = self.meas.is_dirty()  # contours or heights
         if require_decision:
-            decided = seg_decision if self.mode == MODE_SEGMENTATION else meas_decision
+            decided = seg_decision if self._reviewMode() == MODE_SEGMENTATION else meas_decision
             if not decided:
-                slicer.util.warningDisplay(f"Please choose Approve or Flag for the {MODE_TITLES[self.mode]} "
+                slicer.util.warningDisplay(f"Please choose Approve or Flag for the {MODE_TITLES[self._reviewMode()]} "
                                            "before saving.")
                 return False
         elif not (seg_decision or meas_decision or edits_dirty):
@@ -693,6 +749,9 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         return True
 
     def saveAndNext(self):
+        if self.mode == MODE_PLANE:   # Apply already saved the fix; the review decision is in Measurements
+            self.step(1)
+            return
         nothing_to_review = self.mode == MODE_MEASUREMENTS and not self._caseHasMeasurements(self.current_index)
         if not nothing_to_review and not self.saveCase(require_decision=True):
             return
@@ -751,6 +810,7 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.volume_node = None
         self._case_loaded = False
         self._refreshMeasurementLabels()
+        self.plane.refresh()
 
     def onSceneEndClose(self, caller, event):
         if self.parent.isEntered:

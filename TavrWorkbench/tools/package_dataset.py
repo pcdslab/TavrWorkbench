@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Build a portable TavrWorkbench dataset folder from a data map with absolute paths.
 
-Every file a case references is copied into  <out>/cases/<case_id>/...  (the image and label are named
+Every file a case references is copied into  <out>/cases/<case_id>/...  (including the STJ points and
+coronary ostium points the Annular Plane tab uses to regenerate the heights)  (the image and label are named
 after the case: <case_id>.nii.gz and <case_id>.seg.nrrd) and a new data_map.json with
 paths RELATIVE to itself is written next to it. The folder can then be shared (OneDrive, Google Drive,
 USB disk, zip) and opened from any location on macOS or Windows: in TavrWorkbench just select
@@ -18,6 +19,7 @@ and files left in a case folder by an earlier run (e.g. under an old name) are r
 Only the Python standard library is used.
 """
 import argparse
+import glob
 import json
 import os
 import shutil
@@ -26,6 +28,9 @@ import zipfile
 
 FILE_KEYS = ("image", "label")
 GROUP_KEYS = ("hinge_points", "contours", "max_diameters", "min_diameters", "heights", "centerline")
+# Points the Annular Plane tab needs to regenerate the heights; taken from the sample's own group or,
+# for older data maps, from the folder in sample["dirs"] (files L.mrk.json, R.mrk.json, N.mrk.json ...)
+REFERENCE_GROUPS = {"stj_points": ("L", "R", "N"), "coronary_ostia_points": ("L", "R")}
 # Longest first, so ".seg.nrrd" wins over ".nrrd"
 SUFFIXES = (".seg.nrrd", ".nii.gz", ".mrk.json", ".nrrd", ".nii", ".vtp", ".vtk", ".json")
 ALREADY_COMPRESSED = (".gz", ".nrrd", ".zip")
@@ -34,6 +39,35 @@ ALREADY_COMPRESSED = (".gz", ".nrrd", ".zip")
 def suffix_of(path):
     name = os.path.basename(path).lower()
     return next((s for s in SUFFIXES if name.endswith(s)), os.path.splitext(name)[1])
+
+
+def find_letter_file(folder, letter):
+    """L / R / N point file in a folder (L.mrk.json, l_hinge.mrk.json ...), as in the STJ height script."""
+    if not (isinstance(folder, str) and os.path.isdir(folder)):
+        return None
+    candidates = sorted(glob.glob(os.path.join(folder, "*.mrk.json"))) or \
+        sorted(glob.glob(os.path.join(folder, "*.json")))
+    low = letter.lower()
+    for path in candidates:
+        name = os.path.basename(path).lower().split(".")[0]
+        if name == low or name.startswith(low + "_") or name.startswith(low + "-"):
+            return path
+    for path in candidates:
+        if low in os.path.basename(path).lower().replace("-", "_").replace(".", "_").split("_"):
+            return path
+    return None
+
+
+def reference_entries(sample, group):
+    """{letter: path} for a reference group, or {} when the case has none."""
+    explicit = sample.get(group) if isinstance(sample.get(group), dict) else {}
+    folder = (sample.get("dirs") or {}).get(group)
+    found = {}
+    for letter in REFERENCE_GROUPS[group]:
+        path = explicit.get(letter) or find_letter_file(folder, letter)
+        if path:
+            found[letter] = path
+    return found
 
 
 def parse_case_filter(text):
@@ -79,7 +113,7 @@ def copy_file(src, dst):
 def referenced_paths(entry):
     """Every relative file path a new data-map entry points to."""
     paths = [entry[k] for k in FILE_KEYS if k in entry]
-    for group in GROUP_KEYS:
+    for group in list(GROUP_KEYS) + list(REFERENCE_GROUPS):
         paths += list((entry.get(group) or {}).values())
     return paths
 
@@ -142,6 +176,14 @@ def package(map_path, out_dir, cases=None):
                 rel = take(src, f"{group}/{safe_name(name)}")
                 if rel:
                     copied[name] = rel
+            if copied:
+                new[group] = copied
+        for group in REFERENCE_GROUPS:
+            copied = {}
+            for letter, src in reference_entries(sample, group).items():
+                rel = take(src, f"{group}/{letter}")
+                if rel:
+                    copied[letter] = rel
             if copied:
                 new[group] = copied
         stale = remove_stale_files(out_dir, case_rel, new)

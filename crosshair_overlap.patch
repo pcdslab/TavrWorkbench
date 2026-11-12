@@ -1,0 +1,234 @@
+diff --git a/TavrWorkbench/TavrWorkbench.py b/TavrWorkbench/TavrWorkbench.py
+index 1de0c6e..dc930df 100644
+--- a/TavrWorkbench/TavrWorkbench.py
++++ b/TavrWorkbench/TavrWorkbench.py
+@@ -358,6 +358,8 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+             self._views_reformatted = True
+         elif self.mode == MODE_PLANE:
+             self.plane.refresh()
++        if self.mode != MODE_PLANE:
++            self.plane.leave()  # restore the crosshair / slice-intersection settings
+         if measuring:
+             self._views_reformatted = True
+         elif self._views_reformatted:
+@@ -371,7 +373,7 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+             self.seg.set_display(outline_only=False, visible=True, opacity_3d=None)
+             self.seg.set_opacity_3d(1.0)
+         elif self.mode == MODE_PLANE:
+-            self.seg.set_display(outline_only=True, visible=True, opacity_3d=None)
++            self.seg.set_display(outline_only=True, visible=self.plane.show_segmentation(), opacity_3d=None)
+         else:
+             show = bool(self.ui.showSegOutlineCheck.checked)
+             self.seg.set_display(outline_only=True, visible=show,
+diff --git a/TavrWorkbench/TavrWorkbenchLib/annular_plane.py b/TavrWorkbench/TavrWorkbenchLib/annular_plane.py
+index 65da0f5..41b261c 100644
+--- a/TavrWorkbench/TavrWorkbenchLib/annular_plane.py
++++ b/TavrWorkbench/TavrWorkbenchLib/annular_plane.py
+@@ -29,6 +29,9 @@ from .geometry import unit
+ from .storage import now_iso
+ 
+ FLIP = np.array([-1.0, -1.0, 1.0])  # LPS <-> RAS
++# Cusp-overlap views: (button text, the two hinge points that overlap)
++OVERLAP_VIEWS = [("LR", "LCC", "RCC"), ("LN", "LCC", "NCC"), ("RN", "RCC", "NCC")]
++SLICE_VIEWS = ("Red", "Yellow", "Green")
+ OSTIUM_LETTER = {"lch": "L", "rch": "R"}
+ MAX_D_COLOR = [1.0, 0.41568627450980394, 0.0]
+ MIN_D_COLOR = [0.23529411764705882, 0.7725490196078432, 0.3686274509803922]
+@@ -66,13 +69,32 @@ class AnnularPlanePanel:
+         self.resetButton = qt.QPushButton("Reset hinge points")
+         self.resetButton.setToolTip("Put the hinge points back where they were when the case was loaded")
+         self.resetButton.connect("clicked()", self.reset)
+-        self.alignButton = qt.QPushButton("Align view")
+-        self.alignButton.setToolTip("Red = plane through the current hinge points; Green / Yellow = long axis")
++        self.alignButton = qt.QPushButton("Align to annular plane")
++        self.alignButton.setToolTip("Red = plane through LCC, RCC and NCC; Green / Yellow = long axis")
+         self.alignButton.connect("clicked()", self.align_view)
+         row.addWidget(self.resetButton)
+         row.addWidget(self.alignButton)
+         layout.addLayout(row)
+ 
++        overlap_row = qt.QHBoxLayout()
++        overlap_row.addWidget(qt.QLabel("Cusp overlap:"))
++        self.overlapButtons = []
++        for text, a, b in OVERLAP_VIEWS:
++            button = qt.QPushButton(text)
++            button.setToolTip(f"{a} / {b} overlap view: Green looks along the {a}-{b} line, so the two hinge "
++                              f"points overlap; Yellow shows them side by side; Red = annular plane with the "
++                              f"crosshair between them; 3D looks along the same line")
++            button.connect("clicked()", lambda a=a, b=b: self.align_overlap(a, b))
++            overlap_row.addWidget(button)
++            self.overlapButtons.append(button)
++        layout.addLayout(overlap_row)
++
++        self.showSegCheck = qt.QCheckBox("Show segmentation")
++        self.showSegCheck.setToolTip("Show / hide the segmentation outline while correcting the hinge points")
++        self.showSegCheck.setChecked(True)
++        self.showSegCheck.connect("toggled(bool)", lambda _on: self.m._applySegmentationDisplay())
++        layout.addWidget(self.showSegCheck)
++
+         self.applyButton = qt.QPushButton("Apply: back up && regenerate")
+         self.applyButton.setToolTip("Back up the current hinge points, annulus contour, diameters and heights "
+                                     "to archive/v<N>, then regenerate them from the new hinge points")
+@@ -86,13 +108,14 @@ class AnnularPlanePanel:
+         self.resultLabel.setWordWrap(True)
+         layout.addWidget(self.resultLabel)
+         self.last_result = None   # html of the last Apply in this session (per case id)
++        self._saved_view_settings = None   # crosshair / slice-intersection settings before entering the tab
+ 
+     # ------------------------------------------------------------------ panel state
+     def refresh(self):
+         meas = self.m.meas
+         loaded = self.m._case_loaded
+         ok = loaded and meas.has_hinges()
+-        for b in (self.resetButton, self.alignButton, self.applyButton):
++        for b in [self.resetButton, self.alignButton, self.applyButton] + self.overlapButtons:
+             b.setEnabled(ok)
+         if not loaded:
+             self.hingeLabel.setText("")
+@@ -149,12 +172,138 @@ class AnnularPlanePanel:
+         return float(np.degrees(np.arccos(np.clip(abs(np.dot(now[1], before[1])), -1.0, 1.0))))
+ 
+     # ------------------------------------------------------------------ views
++    def show_segmentation(self):
++        return bool(self.showSegCheck.checked)
++
+     def enter(self):
+         slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
++        self._enable_crosshairs()
+         self.align_view()
+         qt.QTimer.singleShot(250, self.align_view)  # slice widgets need a moment to get their final size
+         self.refresh()
+ 
++    def leave(self):
++        """Leaving the tab: put the crosshair / slice-intersection settings back as they were."""
++        self._restore_crosshairs()
++
++    @staticmethod
++    def _slice_display_nodes():
++        lm = slicer.app.layoutManager()
++        out = []
++        for name in SLICE_VIEWS:
++            widget = lm.sliceWidget(name)
++            if widget is None:
++                continue
++            try:
++                node = widget.sliceLogic().GetSliceDisplayNode()
++            except Exception:
++                node = None
++            if node is not None:
++                out.append(node)
++        return out
++
++    @staticmethod
++    def _crosshair_node():
++        return slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLCrosshairNode")
++
++    def _enable_crosshairs(self):
++        """Crosshair (thick) + slice-intersection lines (visible, interactive: drag / rotate, thick)."""
++        if self._saved_view_settings is None:
++            saved = {"slices": [], "crosshair": None}
++            for d in self._slice_display_nodes():
++                try:
++                    saved["slices"].append((d, d.GetIntersectingSlicesVisibility(), d.GetIntersectingSlicesInteractive(),
++                                            d.GetIntersectingSlicesLineThicknessMode()))
++                except Exception:
++                    pass
++            ch = self._crosshair_node()
++            if ch is not None:
++                saved["crosshair"] = (ch, ch.GetCrosshairMode(), ch.GetCrosshairThickness())
++            self._saved_view_settings = saved
++        for d in self._slice_display_nodes():
++            try:  # Slicer >= 5.2
++                d.SetIntersectingSlicesVisibility(True)
++                d.SetIntersectingSlicesInteractive(True)
++                d.SetIntersectingSlicesTranslationEnabled(True)
++                d.SetIntersectingSlicesRotationEnabled(True)
++                d.SetIntersectingSlicesLineThicknessMode(slicer.vtkMRMLSliceDisplayNode.ThickLines)
++            except Exception as e:
++                print(f"[TavrWorkbench] slice intersections not configurable in this Slicer version: {e}")
++        ch = self._crosshair_node()
++        if ch is not None:
++            ch.SetCrosshairMode(slicer.vtkMRMLCrosshairNode.ShowBasic)
++            ch.SetCrosshairThickness(slicer.vtkMRMLCrosshairNode.Thick)
++
++    def _restore_crosshairs(self):
++        saved, self._saved_view_settings = self._saved_view_settings, None
++        if not saved:
++            return
++        for d, visible, interactive, thickness in saved["slices"]:
++            try:
++                d.SetIntersectingSlicesVisibility(visible)
++                d.SetIntersectingSlicesInteractive(interactive)
++                d.SetIntersectingSlicesLineThicknessMode(thickness)
++            except Exception:
++                pass
++        if saved["crosshair"]:
++            ch, mode, thickness = saved["crosshair"]
++            try:
++                ch.SetCrosshairMode(mode)
++                ch.SetCrosshairThickness(thickness)
++            except Exception:
++                pass
++
++    def _set_crosshair(self, ras):
++        ch = self._crosshair_node()
++        if ch is not None:
++            ch.SetCrosshairRAS([float(v) for v in ras])
++
++    def _look_3d(self, focal, direction, up):
++        """3D camera looking along `direction` at `focal` (like a fluoroscopy projection)."""
++        try:
++            view = slicer.app.layoutManager().threeDWidget(0).threeDView()
++            camera = slicer.modules.cameras.logic().GetViewActiveCameraNode(view.mrmlViewNode())
++            dist = 250.0
++            pos = np.asarray(focal) - unit(direction) * dist
++            camera.SetFocalPoint(*[float(v) for v in focal])
++            camera.SetPosition(*[float(v) for v in pos])
++            camera.SetViewUp(*[float(v) for v in up])
++            camera.ResetClippingRange()
++        except Exception as e:
++            print(f"[TavrWorkbench] could not orient the 3D view: {e}")
++
++    def align_overlap(self, a, b):
++        """Cusp-overlap view for hinge points a / b (e.g. LCC / RCC): Green looks along the a-b line, so a and
++        b overlap; Yellow contains the a-b line (side by side); Red = annular plane; crosshair between them."""
++        plane = self._plane_ras()
++        pts = self.m.meas.hinge_points_lps()
++        if plane is None or a not in pts or b not in pts:
++            return
++        c, n, u = plane
++        pa, pb = pts[a] * FLIP, pts[b] * FLIP
++        d = (pb - pa) - np.dot(pb - pa, n) * n          # a -> b, within the annular plane
++        if np.linalg.norm(d) < 1e-6:
++            return
++        d = unit(d)
++        mid = (pa + pb) / 2.0
++        side = unit(np.cross(n, d))                      # in-plane, perpendicular to a-b
++        lm = slicer.app.layoutManager()
++        red = lm.sliceWidget("Red")
++        if red is not None:                              # annular plane, a-b horizontal, centred between them
++            sn = red.mrmlSliceNode()
++            sn.SetSliceToRASByNTP(n[0], n[1], n[2], d[0], d[1], d[2], mid[0], mid[1], mid[2], 0)
++            self.m.meas._set_fov(sn, CONTOUR_FOV)
++        for name, normal, horizontal in (("Green", d, side), ("Yellow", side, d)):
++            widget = lm.sliceWidget(name)
++            if widget is None:
++                continue
++            sn = widget.mrmlSliceNode()
++            sn.SetSliceToRASByNTP(normal[0], normal[1], normal[2], horizontal[0], horizontal[1], horizontal[2],
++                                  mid[0], mid[1], mid[2], 0)
++            self.m.meas._set_fov(sn, HEIGHT_FOV)
++        self._set_crosshair(mid)
++        self._look_3d(mid, d, n)
++
+     def align_view(self):
+         """Red = plane through the current hinge points; Green / Yellow = two long-axis planes."""
+         plane = self._plane_ras()
+@@ -180,6 +329,7 @@ class AnnularPlanePanel:
+             lm.threeDWidget(0).threeDView().setFocalPoint(float(c[0]), float(c[1]), float(c[2]))
+         except Exception:
+             pass
++        self._set_crosshair(c)
+ 
+     def reset(self):
+         self.m.meas.reset_hinges()

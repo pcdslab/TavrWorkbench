@@ -1,0 +1,1668 @@
+diff --git a/TavrWorkbench/TavrWorkbench.py b/TavrWorkbench/TavrWorkbench.py
+index e329dda..1de0c6e 100644
+--- a/TavrWorkbench/TavrWorkbench.py
++++ b/TavrWorkbench/TavrWorkbench.py
+@@ -7,6 +7,8 @@ One case list, two review modes:
+                   Segment Editor, save the edited mask. Measurements are shown locked for context.
+ * Measurements  - correct Annulus / SOV / STJ contours with live area, perimeter and diameters,
+                   correct STJ / coronary heights on long-axis planes, Approve / Flag (overall + per item).
++* Annular Plane - correct the LCC / RCC / NCC hinge points; Apply backs up the current files and
++                  regenerates the annulus contour, its diameters and the STJ / coronary heights.
+ 
+ Both modes share case navigation, the comment, Save / Save & Next and the output folder.
+ Implementation lives in TavrWorkbenchLib/ (see its __init__.py for the module map).
+@@ -26,10 +28,12 @@ from slicer.util import VTKObservationMixin
+ from TavrWorkbenchLib.cases import (case_id_of, has_contours, has_measurements, is_file, is_image_path,
+                                     measurement_rating_keys, read_data_map)
+ from TavrWorkbenchLib.constants import (CASE_MASK_FILE, LOG_FILE, MASK_STATUS_TEXT, MEAS_SEGMENTATION_OPACITY_3D,
+-                                        MEASUREMENT_KEY_TO_LABEL, MODE_MEASUREMENTS, MODE_SEGMENTATION, MODES,
++                                        MEASUREMENT_KEY_TO_LABEL, MODE_MEASUREMENTS, MODE_PLANE, MODE_SEGMENTATION,
++                                        MODES,
+                                         NOT_APPLICABLE_MARK, PENDING_MARK, RATING_ACCEPT, RATING_FLAG,
+                                         RATING_TO_MARK, SEGMENTATION_LABELS, SELECTION_LABELS, SELECTIONS,
+                                         SHORTCUT_ACCEPT, SHORTCUT_FLAG)
++from TavrWorkbenchLib.annular_plane import AnnularPlanePanel
+ from TavrWorkbenchLib.measurement_editor import MeasurementEditor
+ from TavrWorkbenchLib.rating_table import (RatingTable, group_rating, make_decision_group, set_group_rating,
+                                            uncheck_group)
+@@ -39,7 +43,9 @@ from TavrWorkbenchLib.storage import OutputStore
+ # Suppress VTK warnings globally to prevent console flooding and UI freezing
+ vtk.vtkObject.GlobalWarningDisplayOff()
+ 
+-MODE_TITLES = {MODE_SEGMENTATION: "segmentation", MODE_MEASUREMENTS: "measurements"}
++MODE_TITLES = {MODE_SEGMENTATION: "segmentation", MODE_MEASUREMENTS: "measurements",
++               MODE_PLANE: "annular plane"}
++PLANE_FIXED_MARK = " ⟳"   # case list: the annular plane of this case has been fixed
+ 
+ 
+ class TavrWorkbench(ScriptedLoadableModule):
+@@ -140,6 +146,10 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+         self.ui.measItemsCollapsibleButton.setVisible(False)
+         self.seg = SegmentationController(self.ui.segEditorContainer)
+         self.meas = MeasurementEditor(on_update=self._refreshMeasurementLabels)
++        self.plane = AnnularPlanePanel(self)
++        self.meas.on_hinge_moved = self.plane.refresh
++        main_layout = uiWidget.layout()
++        main_layout.insertWidget(main_layout.indexOf(self.ui.measPanel) + 1, self.plane.widget)
+ 
+         self._setupCaseSection()
+         self._setupModeSwitch()
+@@ -176,6 +186,12 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+         self.modeGroup.setExclusive(True)
+         self.modeGroup.addButton(self.ui.segModeButton, 0)
+         self.modeGroup.addButton(self.ui.measModeButton, 1)
++        self.planeModeButton = qt.QPushButton("Annular Plane")
++        self.planeModeButton.setCheckable(True)
++        self.planeModeButton.setToolTip("Correct the hinge points; Apply regenerates the annulus contour, "
++                                        "diameters and heights (previous files are backed up)")
++        self.ui.modeWidget.layout().addWidget(self.planeModeButton)
++        self.modeGroup.addButton(self.planeModeButton, 2)
+         self.modeGroup.connect("buttonClicked(int)", lambda i: self._setMode(MODES[i]))
+ 
+     def _setupSegmentationPanel(self):
+@@ -250,6 +266,11 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+     def _caseHasMeasurements(self, idx):
+         return 0 <= idx < len(self.case_flags) and self.case_flags[idx][0]
+ 
++    def _reviewMode(self, mode=None):
++        """Mode whose Approve / Flag progress applies: the Annular Plane tab follows Measurements."""
++        mode = mode or self.mode
++        return MODE_MEASUREMENTS if mode == MODE_PLANE else mode
++
+     def _isReviewed(self, idx, mode):
+         cid = self.caseId(idx)
+         if mode == MODE_SEGMENTATION:
+@@ -257,12 +278,13 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+         return bool(self.store.meas_rating(cid))
+ 
+     def _needsReview(self, idx, mode):
++        mode = self._reviewMode(mode)
+         if mode == MODE_MEASUREMENTS and not self._caseHasMeasurements(idx):
+             return False
+         return not self._isReviewed(idx, mode)
+ 
+     def _decisionWidgets(self, mode=None):
+-        mode = mode or self.mode
++        mode = self._reviewMode(mode)
+         if mode == MODE_SEGMENTATION:
+             return self.segDecisionGroup, self.ui.segApproveRadio, self.ui.segFlagRadio
+         return self.measDecisionGroup, self.ui.measApproveRadio, self.ui.measFlagRadio
+@@ -290,7 +312,8 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+                 meas_mark = RATING_TO_MARK.get(self.store.meas_rating(cid), PENDING_MARK)
+             else:
+                 meas_mark = NOT_APPLICABLE_MARK
+-            combo.addItem(f"{seg_mark}{meas_mark}  {cid}")
++            fixed = PLANE_FIXED_MARK if self.store.plane_fix_version(cid) else ""
++            combo.addItem(f"{seg_mark}{meas_mark}  {cid}{fixed}")
+         if 0 <= self.current_index < combo.count:
+             combo.setCurrentIndex(self.current_index)
+         combo.blockSignals(False)
+@@ -315,17 +338,26 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+         self.mode = mode
+         is_seg = mode == MODE_SEGMENTATION
+         self.ui.segModeButton.setChecked(is_seg)
+-        self.ui.measModeButton.setChecked(not is_seg)
++        self.ui.measModeButton.setChecked(mode == MODE_MEASUREMENTS)
++        self.planeModeButton.setChecked(mode == MODE_PLANE)
+         self.ui.segPanel.setVisible(is_seg)
+-        self.ui.measPanel.setVisible(not is_seg)
++        self.ui.measPanel.setVisible(mode == MODE_MEASUREMENTS)
++        self.plane.widget.setVisible(mode == MODE_PLANE)
+         if not is_seg:
+             self.seg.deactivate_effect()  # no accidental painting while dragging contour points
+         self._applyModeToScene()
+ 
+     def _applyModeToScene(self):
+         measuring = self.mode == MODE_MEASUREMENTS and self.meas.has_contours()
++        planing = self.mode == MODE_PLANE and self._case_loaded
+         self._applySegmentationDisplay()
++        self.meas.set_plane_mode(self.mode == MODE_PLANE)
+         self.meas.set_mode_active(self.mode == MODE_MEASUREMENTS)
++        if planing:
++            self.plane.enter()
++            self._views_reformatted = True
++        elif self.mode == MODE_PLANE:
++            self.plane.refresh()
+         if measuring:
+             self._views_reformatted = True
+         elif self._views_reformatted:
+@@ -338,6 +370,8 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+         if is_seg:
+             self.seg.set_display(outline_only=False, visible=True, opacity_3d=None)
+             self.seg.set_opacity_3d(1.0)
++        elif self.mode == MODE_PLANE:
++            self.seg.set_display(outline_only=True, visible=True, opacity_3d=None)
+         else:
+             show = bool(self.ui.showSegOutlineCheck.checked)
+             self.seg.set_display(outline_only=True, visible=show,
+@@ -356,7 +390,7 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+         self._views_reformatted = False
+ 
+     def _onDecisionShortcut(self, rating):
+-        if not self.parent.isEntered or not self._case_loaded:
++        if not self.parent.isEntered or not self._case_loaded or self.mode == MODE_PLANE:
+             return
+         _group, approve, flag = self._decisionWidgets()
+         if approve.enabled:
+@@ -451,10 +485,14 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+             j = (self.current_index + k) % n
+             if self._needsReview(j, self.mode):
+                 return self.loadCase(j)
+-        slicer.util.infoDisplay(f"All cases have been reviewed for {MODE_TITLES[self.mode]}.")
++        slicer.util.infoDisplay(f"All cases have been reviewed for {MODE_TITLES[self._reviewMode()]}.")
+ 
+     def _confirmLeaveCase(self):
+-        """Ask about unsaved contour edits. Returns False if the user cancels."""
++        """Ask about unapplied hinge moves / unsaved contour edits. Returns False if the user cancels."""
++        if self._case_loaded and self.meas.hinges_moved():
++            if not slicer.util.confirmOkCancelDisplay(
++                    "The hinge points were moved but not applied (Annular Plane tab). Discard these moves?"):
++                return False
+         if not (self._case_loaded and self.meas.is_dirty()):
+             return True
+         ans = qt.QMessageBox.question(slicer.util.mainWindow(), "Unsaved measurement edits",
+@@ -512,9 +550,22 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+             return label, False
+         return "", False
+ 
++    def _effectiveSample(self, idx):
++        """Data-map sample with this case's regenerated Annular Plane files substituted, if any."""
++        return self.store.effective_sample(self.samples[idx], self.caseId(idx))
++
++    def _reloadMeasurementNodes(self):
++        """Re-create the measurement nodes (after an Annular Plane Apply) without reloading CT / mask."""
++        cid = self.caseId()
++        self.meas.load(self._effectiveSample(self.current_index),
++                       lambda plane: self.store.find_saved_contour(cid, plane),
++                       lambda key, part: self.store.find_saved_height(cid, key, part))
++        self._updateMeasurementPanel()
++        self._applyModeToScene()
++
+     def _loadCaseData(self):
+         self._clearCaseNodes()
+-        sample = self.samples[self.current_index]
++        sample = self._effectiveSample(self.current_index)
+         cid = self.caseId()
+         image_path = sample.get("image", "")
+         print(f"[TavrWorkbench] Loading case {cid} ({self.current_index + 1}/{len(self.samples)}): {image_path}")
+@@ -649,9 +700,9 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+         meas_decision = review["measurements_overall"]
+         edits_dirty = self.meas.is_dirty()  # contours or heights
+         if require_decision:
+-            decided = seg_decision if self.mode == MODE_SEGMENTATION else meas_decision
++            decided = seg_decision if self._reviewMode() == MODE_SEGMENTATION else meas_decision
+             if not decided:
+-                slicer.util.warningDisplay(f"Please choose Approve or Flag for the {MODE_TITLES[self.mode]} "
++                slicer.util.warningDisplay(f"Please choose Approve or Flag for the {MODE_TITLES[self._reviewMode()]} "
+                                            "before saving.")
+                 return False
+         elif not (seg_decision or meas_decision or edits_dirty):
+@@ -693,6 +744,9 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+         return True
+ 
+     def saveAndNext(self):
++        if self.mode == MODE_PLANE:   # Apply already saved the fix; the review decision is in Measurements
++            self.step(1)
++            return
+         nothing_to_review = self.mode == MODE_MEASUREMENTS and not self._caseHasMeasurements(self.current_index)
+         if not nothing_to_review and not self.saveCase(require_decision=True):
+             return
+@@ -751,6 +805,7 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+         self.volume_node = None
+         self._case_loaded = False
+         self._refreshMeasurementLabels()
++        self.plane.refresh()
+ 
+     def onSceneEndClose(self, caller, event):
+         if self.parent.isEntered:
+diff --git a/TavrWorkbench/TavrWorkbenchLib/annular_plane.py b/TavrWorkbench/TavrWorkbenchLib/annular_plane.py
+new file mode 100644
+index 0000000..65da0f5
+--- /dev/null
++++ b/TavrWorkbench/TavrWorkbenchLib/annular_plane.py
+@@ -0,0 +1,373 @@
++"""Annular Plane tab: correct the three hinge points, then regenerate everything that depends on them.
++
++Workflow
++    1. The case's hinge points (LCC / RCC / NCC) are draggable; the annulus contour, its diameters and
++       the STJ / coronary heights are shown locked for reference. Nothing is written while dragging.
++    2. Apply:
++       a. computes the new annulus contour (the annulus measurement pipeline: reslice the segmentation
++          through the new plane, intensity-guided correction, closed spline), its max / min diameters
++          and the LCH / RCH / STJ heights against the new plane - entirely in memory;
++       b. only if all of that succeeded: backs up the files in effect to <output>/<case>/archive/v<N>
++          (plus any saved Measurements corrections for the old plane, which are moved there);
++       c. writes the new hinge points, contour, diameters and heights to <output>/<case>/annular_plane/,
++          which from then on replace the data-map files for this case (Measurements loads them).
++    3. The regenerated contour / diameters / heights are shown; corrections are made in Measurements.
++The shared dataset is never modified.
++"""
++import os
++
++import numpy as np
++import qt
++import slicer
++
++from .annulus_pipeline import (height_plane, load_images, read_point_lps, recompute_annulus,
++                               recompute_coronary_height, recompute_stj_height, write_contour, write_line,
++                               write_point)
++from .cases import reference_points
++from .constants import CONTOUR_FOV, HEIGHT_FOV, HINGE_KEYS
++from .geometry import unit
++from .storage import now_iso
++
++FLIP = np.array([-1.0, -1.0, 1.0])  # LPS <-> RAS
++OSTIUM_LETTER = {"lch": "L", "rch": "R"}
++MAX_D_COLOR = [1.0, 0.41568627450980394, 0.0]
++MIN_D_COLOR = [0.23529411764705882, 0.7725490196078432, 0.3686274509803922]
++
++
++def _separator():
++    line = qt.QFrame()
++    line.setFixedHeight(1)
++    line.setStyleSheet("background-color: white;")
++    return line
++
++
++class AnnularPlanePanel:
++    """Panel + logic of the Annular Plane tab. `module` is the TavrWorkbenchWidget."""
++
++    def __init__(self, module):
++        self.m = module
++        self.widget = qt.QWidget()
++        layout = qt.QVBoxLayout(self.widget)
++        layout.setContentsMargins(0, 0, 0, 0)
++
++        intro = qt.QLabel(
++            "Drag the <b>LCC</b>, <b>RCC</b> and <b>NCC</b> hinge points (slice or 3D views). "
++            "<b>Apply</b> backs up the current files and regenerates the annulus contour, its "
++            "diameters and the STJ / coronary heights. Fine-tune the results in <b>Measurements</b>.")
++        intro.setWordWrap(True)
++        layout.addWidget(intro)
++        layout.addWidget(_separator())
++
++        self.hingeLabel = qt.QLabel("")
++        self.hingeLabel.setTextFormat(qt.Qt.RichText)
++        layout.addWidget(self.hingeLabel)
++
++        row = qt.QHBoxLayout()
++        self.resetButton = qt.QPushButton("Reset hinge points")
++        self.resetButton.setToolTip("Put the hinge points back where they were when the case was loaded")
++        self.resetButton.connect("clicked()", self.reset)
++        self.alignButton = qt.QPushButton("Align view")
++        self.alignButton.setToolTip("Red = plane through the current hinge points; Green / Yellow = long axis")
++        self.alignButton.connect("clicked()", self.align_view)
++        row.addWidget(self.resetButton)
++        row.addWidget(self.alignButton)
++        layout.addLayout(row)
++
++        self.applyButton = qt.QPushButton("Apply: back up && regenerate")
++        self.applyButton.setToolTip("Back up the current hinge points, annulus contour, diameters and heights "
++                                    "to archive/v<N>, then regenerate them from the new hinge points")
++        self.applyButton.setStyleSheet("font-weight: bold;")
++        self.applyButton.connect("clicked()", self.apply)
++        layout.addWidget(self.applyButton)
++        layout.addWidget(_separator())
++
++        self.resultLabel = qt.QLabel("")
++        self.resultLabel.setTextFormat(qt.Qt.RichText)
++        self.resultLabel.setWordWrap(True)
++        layout.addWidget(self.resultLabel)
++        self.last_result = None   # html of the last Apply in this session (per case id)
++
++    # ------------------------------------------------------------------ panel state
++    def refresh(self):
++        meas = self.m.meas
++        loaded = self.m._case_loaded
++        ok = loaded and meas.has_hinges()
++        for b in (self.resetButton, self.alignButton, self.applyButton):
++            b.setEnabled(ok)
++        if not loaded:
++            self.hingeLabel.setText("")
++            self.resultLabel.setText("")
++            return
++        if not ok:
++            missing = [k for k in HINGE_KEYS if k not in meas.hinges]
++            self.hingeLabel.setText(f"<i>This case has no hinge point file for {', '.join(missing)}.</i>")
++            return
++        moves = meas.hinge_moves_mm()
++        html = "<b>Hinge points</b> <span style='color:#888'>(moved since loaded)</span><table cellpadding=2>"
++        for k in HINGE_KEYS:
++            d = moves[k]
++            txt = f"<span style='color:#c60'>{d:.1f} mm</span>" if d > 1e-3 else "unchanged"
++            html += f"<tr><td>{k}</td><td>{txt}</td></tr>"
++        html += "</table>"
++        tilt = self._tilt_change_deg()
++        if tilt is not None and meas.hinges_moved():
++            html += f"Plane tilt changed by <b>{tilt:.1f}°</b> &nbsp; <i>(not applied yet)</i>"
++        self.hingeLabel.setText(html)
++        self._show_status()
++
++    def _show_status(self):
++        cid = self.m.caseId()
++        version = self.m.store.plane_fix_version(cid)
++        if self.last_result and self.last_result[0] == cid:
++            self.resultLabel.setText(self.last_result[1])
++        elif version:
++            when = self.m.store.meas_status.get(cid, {}).get("plane_fixed_at", "")
++            self.resultLabel.setText(f"Annular plane fixed (v{version}, {when}). The contour, diameters and "
++                                     f"heights shown are the regenerated ones; the earlier files are in "
++                                     f"<i>archive/</i>.")
++        else:
++            self.resultLabel.setText("<i>No annular-plane fix applied to this case yet.</i>")
++
++    def _plane_ras(self, loaded=False):
++        """(centroid, normal, u) of the hinge plane in RAS, or None."""
++        pts = self.m.meas.hinge_points_lps(loaded=loaded)
++        if not all(k in pts for k in HINGE_KEYS):
++            return None
++        L, R, N = (pts[k] for k in HINGE_KEYS)
++        normal = np.cross(N - L, R - L)
++        if np.linalg.norm(normal) < 1e-8:
++            return None
++        normal = unit(normal)
++        if normal[2] < 0:
++            normal = -normal
++        return (L + R + N) / 3.0 * FLIP, normal * FLIP, unit(N - L) * FLIP
++
++    def _tilt_change_deg(self):
++        now, before = self._plane_ras(), self._plane_ras(loaded=True)
++        if now is None or before is None:
++            return None
++        return float(np.degrees(np.arccos(np.clip(abs(np.dot(now[1], before[1])), -1.0, 1.0))))
++
++    # ------------------------------------------------------------------ views
++    def enter(self):
++        slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
++        self.align_view()
++        qt.QTimer.singleShot(250, self.align_view)  # slice widgets need a moment to get their final size
++        self.refresh()
++
++    def align_view(self):
++        """Red = plane through the current hinge points; Green / Yellow = two long-axis planes."""
++        plane = self._plane_ras()
++        if plane is None:
++            return
++        c, n, u = plane
++        lm = slicer.app.layoutManager()
++        red = lm.sliceWidget("Red")
++        if red is not None:
++            sn = red.mrmlSliceNode()
++            sn.SetSliceToRASByNTP(n[0], n[1], n[2], u[0], u[1], u[2], c[0], c[1], c[2], 0)
++            self.m.meas._set_fov(sn, CONTOUR_FOV)
++        b = unit(np.cross(n, u))
++        for name, axis in (("Green", u), ("Yellow", b)):
++            widget = lm.sliceWidget(name)
++            if widget is None:
++                continue
++            sn = widget.mrmlSliceNode()
++            normal = unit(np.cross(axis, n))
++            sn.SetSliceToRASByNTP(normal[0], normal[1], normal[2], axis[0], axis[1], axis[2], c[0], c[1], c[2], 0)
++            self.m.meas._set_fov(sn, HEIGHT_FOV)
++        try:
++            lm.threeDWidget(0).threeDView().setFocalPoint(float(c[0]), float(c[1]), float(c[2]))
++        except Exception:
++            pass
++
++    def reset(self):
++        self.m.meas.reset_hinges()
++        self.refresh()
++
++    # ------------------------------------------------------------------ apply
++    def apply(self):
++        m, meas = self.m, self.m.meas
++        if not m._case_loaded or not meas.has_hinges():
++            return
++        if not m.outDir():
++            slicer.util.errorDisplay("Select an output folder first.")
++            return
++        cid = m.caseId()
++        if not meas.hinges_moved() and not slicer.util.confirmYesNoDisplay(
++                "The hinge points have not been moved. Regenerate the annulus contour, diameters and "
++                "heights from the current hinge points anyway?"):
++            return
++        if meas.is_dirty() and not slicer.util.confirmYesNoDisplay(
++                "There are unsaved contour / height edits from the Measurements tab. Apply regenerates the "
++                "annulus contour and heights, so those edits will be discarded. Continue?"):
++            return
++        version_preview, _dir = m.store.next_archive_dir(cid)
++        if not slicer.util.confirmYesNoDisplay(
++                f"Case {cid}: back up the current hinge points, annulus contour, diameters and heights to "
++                f"archive/v{version_preview}, then regenerate them from the new hinge points?"):
++            return
++
++        sample = m._effectiveSample(m.current_index)
++        slicer.app.setOverrideCursor(qt.Qt.WaitCursor)
++        try:
++            try:
++                result = self._compute(sample)          # a) everything in memory first
++            except Exception as e:
++                import traceback
++                traceback.print_exc()
++                slicer.util.errorDisplay(f"Could not regenerate the measurements for case {cid}; "
++                                         f"nothing was changed.\n\n{e}")
++                return
++            try:
++                version, adir = self._backup_and_write(cid, sample, result)   # b) + c)
++            except Exception as e:
++                import traceback
++                traceback.print_exc()
++                slicer.util.errorDisplay(f"Writing the new files for case {cid} failed:\n{e}\n\n"
++                                         f"The previous files are in {m.store.next_archive_dir(cid)[1]} "
++                                         f"(or the latest archive/v* folder).")
++                return
++        finally:
++            slicer.app.restoreOverrideCursor()
++
++        meas.mark_saved()                 # edits for the old plane were archived / discarded
++        m._reloadMeasurementNodes()       # show the regenerated files (hinge "loaded" = new positions)
++        self.last_result = (cid, self._result_html(version, adir, result))
++        self.refresh()
++        self.align_view()
++        m.refreshCombo()
++        slicer.util.showStatusMessage(f"Case {cid}: annular plane applied (backup in archive/v{version})", 5000)
++
++    # ------------------------------------------------------------------ steps
++    def _compute(self, sample):
++        m, meas = self.m, self.m.meas
++        new = meas.hinge_points_lps()
++        old = meas.hinge_points_lps(loaded=True)
++        L, R, N = (new[k] for k in HINGE_KEYS)
++        oL, oR, oN = (old[k] for k in HINGE_KEYS)
++
++        label_path, _from_saved = m._resolveLabelPath(sample, m.caseId())
++        if not label_path:
++            raise ValueError("This case has no segmentation; the annulus contour is derived from it.")
++        ct, seg = load_images(sample["image"], label_path)
++        annulus = recompute_annulus(ct, seg, L, R, N)
++
++        heights, notes = {}, []
++        old_point, old_normal = height_plane(oL, oR, oN)
++        for key in ("lch", "rch"):
++            ostium = self._far_endpoint(key, old_point, old_normal)
++            source = "current line"
++            if ostium is None:
++                files = reference_points(sample, "coronary_ostia_points")
++                letter = OSTIUM_LETTER[key]
++                if letter in files:
++                    ostium, source = read_point_lps(files[letter]), "ostium point file"
++            if ostium is None:
++                notes.append(f"{key.upper()}: no height line or ostium point for this case - not regenerated.")
++                continue
++            foot, length = recompute_coronary_height(ostium, L, R, N)
++            heights[key] = {"p1": ostium, "p2": foot, "length": length, "label": key.upper(),
++                            "old": self._line_length(key), "source": source}
++        stj_files = reference_points(sample, "stj_points")
++        if len(stj_files) == 3:
++            pts = {c: read_point_lps(p) for c, p in stj_files.items()}
++            cusp, point, foot, h, _dists = recompute_stj_height(pts, L, R, N)
++            heights["stj"] = {"p1": point, "p2": foot, "length": h, "label": f"STJ_H_{cusp}", "cusp": cusp,
++                              "old": self._line_length("stj"), "source": "STJ points L/R/N"}
++        else:
++            point = self._far_endpoint("stj", old_point, old_normal)
++            if point is not None:
++                foot, h = recompute_coronary_height(point, L, R, N)
++                heights["stj"] = {"p1": point, "p2": foot, "length": h, "label": "STJ_H", "cusp": "",
++                                  "old": self._line_length("stj"), "source": "current line (cusp kept)"}
++                notes.append("STJ: the three STJ points were not found, so the STJ point of the current line was "
++                             "kept (the closest cusp could not be re-chosen).")
++            else:
++                notes.append("STJ: no STJ points or height line for this case - not regenerated.")
++        return {"hinges": new, "annulus": annulus, "heights": heights, "notes": notes}
++
++    def _far_endpoint(self, key, plane_point, normal):
++        """LPS endpoint of a height line farthest from the (old) annular plane: the ostium / STJ point."""
++        node = self.m.meas.heights.get(key)
++        if node is None or node.GetNumberOfControlPoints() == 0:
++            return None
++        pts = self.m.meas._get_pts(node) * FLIP
++        dist = np.abs((pts - plane_point) @ normal)
++        return pts[int(np.argmax(dist))]
++
++    def _line_length(self, key):
++        node = self.m.meas.heights.get(key)
++        if node is None or node.GetNumberOfControlPoints() != 2:
++            return None
++        p = self.m.meas._get_pts(node)
++        return float(np.linalg.norm(p[1] - p[0]))
++
++    def _backup_and_write(self, cid, sample, result):
++        store = self.m.store
++        version, adir, manifest = store.archive_before_plane_fix(cid, sample)
++        os.makedirs(store.plane_dir(cid), exist_ok=True)
++
++        def target(group, name):
++            return store.plane_file(cid, (group, name))
++
++        for k in HINGE_KEYS:
++            write_point(target("hinge_points", k), k, result["hinges"][k])
++        a = result["annulus"]
++        write_contour(target("contours", "annulus"), a["contour_lps"], a["area_mm2"], a["perimeter_mm"])
++        write_line(target("max_diameters", "annulus"), "L", a["max_pts"][0], a["max_pts"][1], MAX_D_COLOR)
++        write_line(target("min_diameters", "annulus"), "L_1", a["min_pts"][0], a["min_pts"][1], MIN_D_COLOR)
++        for key in ("stj", "lch", "rch"):
++            path = target("heights", key)
++            h = result["heights"].get(key)
++            if h is not None:
++                write_line(path, h["label"], h["p1"], h["p2"])
++            elif os.path.isfile(path):
++                os.remove(path)  # a regenerated file from an earlier fix no longer matches (it is archived)
++
++        hinges = result["hinges"]
++        corr = a.get("correction") or {}
++        row = {"applied_at": now_iso(),
++               "area_mm2": round(a["area_mm2"], 2), "perimeter_mm": round(a["perimeter_mm"], 2),
++               "max_d_mm": round(a["max_d_mm"], 2), "min_d_mm": round(a["min_d_mm"], 2),
++               "mean_d_mm": round(a["mean_d_mm"], 2), "eccentricity": round(a["eccentricity"], 4),
++               "corrected": a["corrected"], "iou_vs_original": corr.get("iou_vs_original", ""),
++               "stj_cusp": (result["heights"].get("stj") or {}).get("cusp", "")}
++        for k in HINGE_KEYS:
++            for axis, v in zip("xyz", hinges[k]):
++                row[f"{k.lower()}_{axis}"] = round(float(v), 4)
++        for key in ("lch", "rch"):
++            h = result["heights"].get(key)
++            row[f"{key}_mm"] = round(h["length"], 2) if h else ""
++        h = result["heights"].get("stj")
++        row["stj_height_mm"] = round(h["length"], 2) if h else ""
++        manifest["notes"] = result["notes"]
++        store.record_plane_fix(cid, version, adir, manifest, row)
++        return version, adir
++
++    @staticmethod
++    def _result_html(version, adir, result):
++        a = result["annulus"]
++        corr = a.get("correction") or {}
++        html = (f"<b>Applied (v{version})</b> &nbsp; previous files backed up to:<br><i>{adir}</i><br>"
++                "<b>ANNULUS</b> (regenerated)<table cellpadding=2>"
++                f"<tr><td>Area</td><td>{a['area_mm2']:.1f} mm²</td></tr>"
++                f"<tr><td>Perimeter</td><td>{a['perimeter_mm']:.1f} mm</td></tr>"
++                f"<tr><td>Max / min ⌀</td><td>{a['max_d_mm']:.1f} / {a['min_d_mm']:.1f} mm</td></tr>"
++                f"<tr><td>Mean ⌀ / ecc.</td><td>{a['mean_d_mm']:.1f} mm / {a['eccentricity']:.3f}</td></tr>")
++        if a["corrected"]:
++            html += f"<tr><td>HU correction</td><td>IoU {corr.get('iou_vs_original', '')} vs. segmentation</td></tr>"
++        html += "</table><b>HEIGHTS</b> (regenerated)<table cellpadding=2>"
++        names = {"stj": "STJ height", "lch": "LCH", "rch": "RCH"}
++        for key in ("stj", "lch", "rch"):
++            h = result["heights"].get(key)
++            if h is None:
++                html += f"<tr><td>{names[key]}</td><td><i>not regenerated</i></td></tr>"
++                continue
++            old = f" (was {h['old']:.1f})" if h.get("old") is not None else ""
++            cusp = f" [{h['cusp']}]" if h.get("cusp") else ""
++            html += f"<tr><td>{names[key]}{cusp}</td><td>{h['length']:.1f} mm{old}</td></tr>"
++        html += "</table>"
++        for note in result["notes"]:
++            html += f"<br><span style='color:#c60'>{note}</span>"
++        return html
+diff --git a/TavrWorkbench/TavrWorkbenchLib/annulus_pipeline.py b/TavrWorkbench/TavrWorkbenchLib/annulus_pipeline.py
+new file mode 100644
+index 0000000..0a71ff6
+--- /dev/null
++++ b/TavrWorkbench/TavrWorkbenchLib/annulus_pipeline.py
+@@ -0,0 +1,551 @@
++"""Annular-plane recomputation: annulus contour, diameters and heights from the three hinge points.
++
++A port of the batch scripts
++    * aortic annulus measurement pipeline   (spline contour + robust HU correction)
++    * compute_coronary_hinge_lines.py       (LCH / RCH)
++    * STJ height script                     (STJ_H)
++for ONE case, runnable inside 3D Slicer without extra packages: only numpy and SimpleITK (both ship
++with Slicer). The scipy / scikit-image calls of the original are re-implemented here in numpy, with the
++same parameters and behaviour; SimpleITK is used exactly as before for reading and reslicing.
++
++All coordinates in this module are LPS (ITK / SimpleITK physical space), like the original scripts.
++Max / min diameters use the extension's own definition (geometry.compute_metrics), so the values match
++the Measurements tab.
++"""
++import json
++import os
++from collections import deque
++
++import numpy as np
++
++from .constants import ANNULUS_PIPELINE
++from .geometry import compute_metrics
++
++MRK_SCHEMA = ("https://raw.githubusercontent.com/slicer/slicer/master/Modules/Loadable/Markups/"
++              "Resources/Schema/markups-schema-v1.0.3.json#")
++STJ_CUSPS = ("L", "R", "N")
++
++
++# ============================================================================ markup files
++def read_point_lps(path, index=0):
++    """One control point of a .mrk.json, in LPS."""
++    with open(path) as f:
++        markup = json.load(f)["markups"][0]
++    points = markup.get("controlPoints") or []
++    if len(points) <= index:
++        raise ValueError(f"No control point {index + 1} in {path}")
++    pos = np.array(points[index]["position"], dtype=float)
++    if markup.get("coordinateSystem", "LPS").upper() == "RAS":
++        pos = pos * np.array([-1.0, -1.0, 1.0])
++    return pos
++
++
++def _control_point(i, label, pos, associated=""):
++    return {
++        "id": str(i), "label": label, "description": "", "associatedNodeID": associated,
++        "position": [float(pos[0]), float(pos[1]), float(pos[2])],
++        "orientation": [-1.0, -0.0, -0.0, -0.0, -1.0, -0.0, 0.0, 0.0, 1.0],
++        "selected": True, "locked": False, "visibility": True, "positionStatus": "defined",
++    }
++
++
++def _display(**overrides):
++    d = {
++        "visibility": True, "opacity": 1.0, "color": [0.4, 1.0, 1.0],
++        "selectedColor": [1.0, 0.5, 0.5], "activeColor": [0.4, 1.0, 0.0],
++        "propertiesLabelVisibility": True, "pointLabelsVisibility": False,
++        "textScale": 3.0, "glyphType": "Sphere3D", "glyphScale": 3.0, "glyphSize": 5.0, "useGlyphScale": True,
++        "sliceProjection": False, "sliceProjectionUseFiducialColor": True,
++        "sliceProjectionOutlinedBehindSlicePlane": False, "sliceProjectionColor": [1.0, 1.0, 1.0],
++        "sliceProjectionOpacity": 0.6, "lineThickness": 0.2, "handlesInteractive": False,
++        "translationHandleVisibility": True, "rotationHandleVisibility": True, "scaleHandleVisibility": False,
++        "interactionHandleScale": 3.0, "snapMode": "toVisibleSurface",
++    }
++    d.update(overrides)
++    return d
++
++
++def _write_markup(path, markup):
++    tmp = path + ".tmp"
++    with open(tmp, "w") as f:
++        json.dump({"@schema": MRK_SCHEMA, "markups": [markup]}, f, indent=4)
++    os.replace(tmp, path)
++
++
++def write_point(path, label, pos_lps):
++    """Single-point Fiducial markup (hinge points)."""
++    _write_markup(path, {
++        "type": "Fiducial", "coordinateSystem": "LPS", "coordinateUnits": "mm", "locked": False,
++        "fixedNumberOfControlPoints": False, "labelFormat": "%N-%d", "lastUsedControlPointNumber": 1,
++        "controlPoints": [_control_point(1, label, pos_lps)],
++        "display": _display(pointLabelsVisibility=True),
++    })
++
++
++def write_contour(path, pts_lps, area_mm2, perimeter_mm):
++    """ClosedCurve markup, same layout as save_slicer_contour() of the original pipeline."""
++    _write_markup(path, {
++        "type": "ClosedCurve", "coordinateSystem": "LPS", "coordinateUnits": "mm", "locked": False,
++        "fixedNumberOfControlPoints": False, "labelFormat": "%N-%d",
++        "lastUsedControlPointNumber": len(pts_lps),
++        "controlPoints": [_control_point(i, f"AC-{i}", p) for i, p in enumerate(pts_lps, start=1)],
++        "measurements": [
++            {"name": "length", "enabled": True, "value": float(perimeter_mm), "units": "mm",
++             "printFormat": "%-#4.4gmm"},
++            {"name": "area", "enabled": True, "value": round(area_mm2 / 100.0, 6), "units": "cm2",
++             "printFormat": "%-#4.4gcm2"},
++        ],
++        "display": _display(color=[0.0, 1.0, 1.0], textScale=1.7, glyphScale=2.1),
++    })
++
++
++def write_line(path, label_prefix, p1_lps, p2_lps, selected_color=None):
++    """Two-point Line markup (diameters and heights), same layout as the original scripts."""
++    length = float(np.linalg.norm(np.asarray(p1_lps) - np.asarray(p2_lps)))
++    _write_markup(path, {
++        "type": "Line", "coordinateSystem": "LPS", "coordinateUnits": "mm", "locked": False,
++        "fixedNumberOfControlPoints": False, "labelFormat": "%N-%d", "lastUsedControlPointNumber": 2,
++        "controlPoints": [_control_point(1, f"{label_prefix}-1", p1_lps),
++                          _control_point(2, f"{label_prefix}-2", p2_lps)],
++        "measurements": [{"name": "length", "enabled": True, "value": length, "units": "mm",
++                          "printFormat": "%-#4.4gmm"}],
++        "display": _display(selectedColor=selected_color or [0.43529411764705883, 0.7215686274509804,
++                                                             0.8235294117647058],
++                            lineColorFadingStart=1.0, lineColorFadingEnd=10.0,
++                            lineColorFadingSaturation=1.0, lineColorFadingHueOffset=0.0),
++    })
++    return length
++
++
++# ============================================================================ plane geometry
++def compute_plane(L, N, R, shift_mm=0.0):
++    """Annular plane of the measurement pipeline: (centroid, normal, u, w, shifted centroid)."""
++    centroid = (L + N + R) / 3.0
++    v1, v2 = N - L, R - L
++    normal = np.cross(v1, v2)
++    norm = np.linalg.norm(normal)
++    if norm < 1e-8:
++        raise ValueError("The hinge points are (nearly) on one line; they do not define a plane.")
++    normal = normal / norm
++    if normal[2] < 0:
++        normal = -normal
++    u = v1 / np.linalg.norm(v1)
++    w = np.cross(normal, u)
++    w /= np.linalg.norm(w)
++    return centroid, normal, u, w, centroid + shift_mm * normal
++
++
++def height_plane(L, R, N):
++    """Plane used by the height scripts: (point on plane, unit normal) through the three hinge points."""
++    normal = np.cross(R - L, N - L)
++    norm = np.linalg.norm(normal)
++    if norm < 1e-8:
++        raise ValueError("The hinge points are (nearly) on one line; they do not define a plane.")
++    return L, normal / norm
++
++
++def perpendicular_foot(point, plane_point, normal):
++    signed = float(np.dot(point - plane_point, normal))
++    return point - signed * normal, abs(signed)
++
++
++# ============================================================================ SimpleITK I/O
++def load_images(ct_path, seg_path):
++    import SimpleITK as sitk
++    ct = sitk.ReadImage(ct_path)
++    seg = sitk.ReadImage(seg_path)
++    if seg.GetNumberOfComponentsPerPixel() > 1:
++        seg = sitk.VectorIndexSelectionCast(seg, 0)
++    return ct, sitk.Cast(seg, sitk.sitkUInt8)
++
++
++def reslice(image, size_2d, res, origin_2d, direction_2d, nearest, float_output):
++    import SimpleITK as sitk
++    r = sitk.ResampleImageFilter()
++    r.SetSize([size_2d, size_2d, 1])
++    r.SetOutputSpacing([res, res, 1.0])
++    r.SetOutputOrigin(origin_2d)
++    r.SetOutputDirection(direction_2d)
++    r.SetInterpolator(sitk.sitkNearestNeighbor if nearest else sitk.sitkLinear)
++    r.SetOutputPixelType(sitk.sitkFloat32 if float_output else sitk.sitkUInt8)
++    arr = np.squeeze(sitk.GetArrayFromImage(r.Execute(image)))
++    if arr.ndim != 2:
++        raise ValueError(f"Resliced array is {arr.ndim}D")
++    return arr
++
++
++# ============================================================================ 2D helpers (numpy)
++def fill_holes(mask):
++    """scipy.ndimage.binary_fill_holes: background not 4-connected to the border becomes foreground."""
++    mask = np.asarray(mask, bool)
++    H, W = mask.shape
++    outside = np.zeros_like(mask)
++    queue = deque()
++    for r in range(H):
++        for c in (0, W - 1):
++            if not mask[r, c] and not outside[r, c]:
++                outside[r, c] = True
++                queue.append((r, c))
++    for c in range(W):
++        for r in (0, H - 1):
++            if not mask[r, c] and not outside[r, c]:
++                outside[r, c] = True
++                queue.append((r, c))
++    while queue:
++        r, c = queue.popleft()
++        for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
++            if 0 <= rr < H and 0 <= cc < W and not mask[rr, cc] and not outside[rr, cc]:
++                outside[rr, cc] = True
++                queue.append((rr, cc))
++    return ~outside
++
++
++def largest_component(mask):
++    """Largest 8-connected region (skimage.measure.label default for 2D): (centroid (row, col), area) or None."""
++    mask = np.asarray(mask, bool)
++    H, W = mask.shape
++    seen = np.zeros_like(mask)
++    best = None
++    for r0, c0 in zip(*np.nonzero(mask)):
++        if seen[r0, c0]:
++            continue
++        seen[r0, c0] = True
++        queue, pixels = deque([(r0, c0)]), []
++        while queue:
++            r, c = queue.popleft()
++            pixels.append((r, c))
++            for dr in (-1, 0, 1):
++                for dc in (-1, 0, 1):
++                    rr, cc = r + dr, c + dc
++                    if 0 <= rr < H and 0 <= cc < W and mask[rr, cc] and not seen[rr, cc]:
++                        seen[rr, cc] = True
++                        queue.append((rr, cc))
++        if best is None or len(pixels) > len(best):
++            best = pixels
++    if best is None:
++        return None
++    pts = np.array(best, dtype=float)
++    return (float(pts[:, 0].mean()), float(pts[:, 1].mean())), len(best)
++
++
++def _gaussian_kernel(sigma, truncate=4.0):
++    radius = int(truncate * float(sigma) + 0.5)
++    x = np.arange(-radius, radius + 1, dtype=float)
++    k = np.exp(-0.5 * (x / sigma) ** 2)
++    return k / k.sum(), radius
++
++
++def gaussian_filter1d(values, sigma):
++    """scipy.ndimage.gaussian_filter1d (mode='reflect', truncate=4)."""
++    k, radius = _gaussian_kernel(sigma)
++    padded = np.pad(np.asarray(values, float), radius, mode="symmetric")
++    return np.convolve(padded, k, mode="valid")
++
++
++def gaussian_filter2d(image, sigma):
++    """scipy.ndimage.gaussian_filter for a 2D image (mode='reflect', truncate=4)."""
++    k, radius = _gaussian_kernel(sigma)
++    img = np.asarray(image, float)
++    padded = np.pad(img, radius, mode="symmetric")
++    rows = np.apply_along_axis(lambda v: np.convolve(v, k, mode="valid"), 1, padded)
++    return np.apply_along_axis(lambda v: np.convolve(v, k, mode="valid"), 0, rows)
++
++
++def find_peaks(x, height):
++    """scipy.signal.find_peaks(x, height=...): local maxima (plateaus -> middle), edges excluded."""
++    x = np.asarray(x, float)
++    peaks, i, n = [], 1, len(x)
++    while i < n - 1:
++        if x[i - 1] < x[i]:
++            j = i
++            while j + 1 < n and x[j + 1] == x[i]:
++                j += 1
++            if j + 1 < n and x[j + 1] < x[i]:
++                peaks.append((i + j) // 2)
++                i = j
++        i += 1
++    return np.array([p for p in peaks if x[p] >= height], dtype=int)
++
++
++def polygon_mask(shape, pts):
++    """skimage.draw.polygon2mask: pixel centres inside the (row, col) polygon (even-odd rule)."""
++    H, W = shape
++    rr, cc = np.mgrid[0:H, 0:W]
++    rr, cc = rr.astype(float), cc.astype(float)
++    inside = np.zeros(shape, bool)
++    pr, pc = np.asarray(pts, float)[:, 0], np.asarray(pts, float)[:, 1]
++    n = len(pts)
++    for i in range(n):
++        r1, c1, r2, c2 = pr[i], pc[i], pr[(i + 1) % n], pc[(i + 1) % n]
++        crosses = (r1 > rr) != (r2 > rr)
++        with np.errstate(divide="ignore", invalid="ignore"):
++            c_at = (c2 - c1) * (rr - r1) / (r2 - r1) + c1
++        inside ^= crosses & (cc < c_at)
++    return inside
++
++
++# ============================================================================ prior mask + correction
++def build_annulus_mask(sampled, res):
++    """Labels at the plane centre (excluding background 0 and coronaries 4) form the prior mask."""
++    sampled = np.squeeze(sampled)
++    cy, cx = sampled.shape[0] // 2, sampled.shape[1] // 2
++    h = int(30 / res) // 2
++    centre = sampled[cy - h: cy + h, cx - h: cx + h]
++    exclude = {0, 4}
++    valid = [int(v) for v in np.unique(centre) if v not in exclude]
++    if valid:
++        mask = np.isin(sampled, valid)
++    else:
++        mask = (sampled != 0) & (sampled != 4)
++        valid = [int(v) for v in np.unique(sampled) if v not in exclude]
++    return fill_holes(mask).astype(np.uint8), valid
++
++
++def _radial_hu_boundary(prior_mask, ct_slice, res, hu_lo, hu_hi, margin_mm, gap_tolerance_mm, n_rays):
++    comp = largest_component(prior_mask)
++    if comp is None:
++        return None, 0
++    (cy, cx), _area = comp
++    H, W = prior_mask.shape
++    max_r = np.hypot(H, W)
++    margin_px = margin_mm / res
++    gap_tol_px = max(0.0, gap_tolerance_mm / res)
++    step = 0.5
++
++    def hu_at(t, dr, dc):
++        ri = int(np.clip(np.round(cy + t * dr), 0, H - 1))
++        ci = int(np.clip(np.round(cx + t * dc), 0, W - 1))
++        return ct_slice[ri, ci]
++
++    pts, n_clipped = [], 0
++    for theta in np.linspace(0, 2 * np.pi, n_rays, endpoint=False):
++        dr, dc = np.sin(theta), np.cos(theta)
++        r0, prev_t = None, 0.0
++        for t in np.arange(1.0, max_r, step):
++            ri = int(np.clip(np.round(cy + t * dr), 0, H - 1))
++            ci = int(np.clip(np.round(cx + t * dc), 0, W - 1))
++            if prior_mask[ri, ci] == 0:
++                r0 = t - 0.25
++                break
++            prev_t = t
++        if r0 is None:
++            r0 = prev_t
++        hit_margin = False
++        if hu_lo <= hu_at(r0, dr, dc) <= hu_hi:      # inside the lumen window: walk outwards
++            final_t, miss, t = r0, 0.0, r0
++            while t <= r0 + margin_px:
++                if hu_lo <= hu_at(t, dr, dc) <= hu_hi:
++                    miss, final_t = 0.0, t
++                else:
++                    miss += step
++                    if miss > gap_tol_px:
++                        break
++                t += step
++            else:
++                hit_margin = True
++        else:                                        # outside the window: walk inwards
++            final_t, miss, t = r0, 0.0, r0
++            while t >= r0 - margin_px:
++                if hu_lo <= hu_at(t, dr, dc) <= hu_hi:
++                    miss, final_t = 0.0, t
++                else:
++                    miss += step
++                    if miss > gap_tol_px:
++                        break
++                t -= step
++            else:
++                hit_margin = True
++        n_clipped += int(hit_margin)
++        pts.append((cy + final_t * dr, cx + final_t * dc))
++    return np.array(pts), n_clipped
++
++
++def correct_mask_with_intensity(original_mask, ct_slice, res, margin_mm, hu_expansion_k,
++                                gap_tolerance_mm, n_rays, ct_smoothing_sigma_mm):
++    """Refine the prior mask with CT intensity (robust HU estimate + per-ray radial walk)."""
++    hu_vals = ct_slice[original_mask > 0]
++    if hu_vals.size == 0:
++        return original_mask.copy(), {}
++    n_bins = min(100, max(30, len(hu_vals) // 20))
++    counts, edges = np.histogram(hu_vals, bins=n_bins)
++    centers = (edges[:-1] + edges[1:]) / 2
++    smoothed = gaussian_filter1d(counts.astype(float), 2.0)
++    peaks = find_peaks(smoothed, height=np.max(smoothed) * 0.1)
++
++    def median_mad():
++        med = float(np.median(hu_vals))
++        mad = float(np.median(np.abs(hu_vals - med)))
++        return med, (1.4826 * mad if mad > 0 else float(np.std(hu_vals)))
++
++    method = "median+MAD (unimodal)"
++    if len(peaks) >= 2:
++        right, second = peaks[-1], peaks[-2]
++        valley = second + int(np.argmin(smoothed[second:right + 1]))
++        true_vals = hu_vals[hu_vals >= centers[valley]]
++        if len(true_vals) > 0.05 * len(hu_vals):
++            hu_mean, hu_std = float(np.mean(true_vals)), float(np.std(true_vals))
++            method = f"peak isolated above {centers[valley]:.1f} HU"
++        else:
++            hu_mean, hu_std = median_mad()
++            method = "median+MAD (right peak too small)"
++    else:
++        hu_mean, hu_std = median_mad()
++    if hu_std == 0:
++        hu_std = 1.0
++    hu_lo, hu_hi = hu_mean - hu_expansion_k * hu_std, hu_mean + hu_expansion_k * hu_std
++
++    walk_ct = gaussian_filter2d(ct_slice, ct_smoothing_sigma_mm / res) if ct_smoothing_sigma_mm > 0 else ct_slice
++    pts, n_clipped = _radial_hu_boundary(original_mask, walk_ct, res, hu_lo, hu_hi,
++                                         margin_mm, gap_tolerance_mm, n_rays)
++    if pts is not None:
++        mask = fill_holes(polygon_mask(original_mask.shape, pts)).astype(np.uint8)
++    else:
++        mask, n_clipped = original_mask.copy(), 0
++    inter = np.logical_and(mask, original_mask).sum()
++    union = np.logical_or(mask, original_mask).sum()
++    return mask, {
++        "hu_method": method,
++        "hu_mean": round(hu_mean, 2), "hu_std": round(hu_std, 2),
++        "hu_lo": round(hu_lo, 2), "hu_hi": round(hu_hi, 2),
++        "iou_vs_original": round(float(inter / union) if union else 0.0, 4),
++        "pct_rays_margin_limited": round(100.0 * n_clipped / n_rays, 1) if n_rays else 0.0,
++    }
++
++
++# ============================================================================ spline contour
++def polar_boundary_samples(mask, n_angles):
++    comp = largest_component(mask)
++    if comp is None:
++        return None
++    (cy, cx), _area = comp
++    max_r = np.hypot(mask.shape[0], mask.shape[1])
++    pts = []
++    for theta in np.linspace(0, 2 * np.pi, n_angles, endpoint=False):
++        dr, dc = np.sin(theta), np.cos(theta)
++        for t in np.arange(1.0, max_r, 0.5):
++            ri = int(np.clip(np.round(cy + t * dr), 0, mask.shape[0] - 1))
++            ci = int(np.clip(np.round(cx + t * dc), 0, mask.shape[1] - 1))
++            if mask[ri, ci] == 0:
++                pts.append((cy + (t - 0.25) * dr, cx + (t - 0.25) * dc))
++                break
++        else:
++            pts.append((cy + (max_r - 1) * dr, cx + (max_r - 1) * dc))
++    return np.array(pts)
++
++
++def fit_closed_spline(pts_px, n_eval):
++    """Closed (periodic) interpolating cubic spline through (row, col) points, chord-length
++    parameterised, evaluated at n_eval equally spaced parameter values: the same curve as
++    scipy.interpolate.splprep(s=0, k=3, per=True) + splev in the original pipeline."""
++    pts = np.asarray(pts_px, float)
++    keep = np.r_[True, np.linalg.norm(np.diff(pts, axis=0), axis=1) > 1e-9]
++    pts = pts[keep]
++    if len(pts) > 1 and np.linalg.norm(pts[0] - pts[-1]) < 1e-9:
++        pts = pts[:-1]
++    n = len(pts)
++    if n < 4:
++        raise ValueError("too few boundary points for a spline")
++    closed = np.vstack([pts, pts[:1]])
++    seg = np.linalg.norm(np.diff(closed, axis=0), axis=1)
++    t = np.r_[0.0, np.cumsum(seg)] / seg.sum()          # knots t_0 .. t_n (t_n = 1)
++    h = np.diff(t)                                      # h_0 .. h_{n-1}
++    A = np.zeros((n, n))
++    for i in range(n):
++        hp, hi = h[i - 1], h[i]                         # h[-1] wraps to h[n-1]
++        A[i, i - 1] += hp
++        A[i, i] += 2 * (hp + hi)
++        A[i, (i + 1) % n] += hi
++    out = []
++    u = np.linspace(0, 1, n_eval, endpoint=False)
++    k = np.clip(np.searchsorted(t, u, side="right") - 1, 0, n - 1)
++    for dim in range(2):
++        y = closed[:, dim]
++        rhs = np.array([6 * ((y[i + 1] - y[i]) / h[i] - (y[i] - y[i - 1 if i else n - 1]) / h[i - 1])
++                        for i in range(n)])
++        M = np.linalg.solve(A, rhs)
++        M = np.r_[M, M[0]]
++        a, b = t[k + 1] - u, u - t[k]
++        hk = h[k]
++        out.append((M[k] * a ** 3 + M[k + 1] * b ** 3) / (6 * hk)
++                   + (y[k] / hk - M[k] * hk / 6) * a + (y[k + 1] / hk - M[k + 1] * hk / 6) * b)
++    return np.column_stack(out)
++
++
++def spline_area_perimeter(spline_px, res):
++    pts_mm = spline_px * res
++    perimeter = float(np.linalg.norm(np.diff(pts_mm, axis=0, append=pts_mm[:1]), axis=1).sum())
++    x, y = pts_mm[:, 1], pts_mm[:, 0]
++    area = 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
++    return float(area), perimeter
++
++
++def to_lps(spline_px, origin_2d, u, w, res):
++    origin = np.asarray(origin_2d, float)
++    return origin[None, :] + spline_px[:, 1:2] * res * u[None, :] + spline_px[:, 0:1] * res * w[None, :]
++
++
++# ============================================================================ one case
++def recompute_annulus(ct_image, seg_image, L, R, N, cfg=None):
++    """Annulus contour for the plane through hinge points L, R, N (LPS). Returns a dict with
++    contour_lps (control points), dense_lps, area/perimeter (spline), Feret diameters + endpoints,
++    and correction details. Raises ValueError when no contour can be found."""
++    cfg = dict(ANNULUS_PIPELINE, **(cfg or {}))
++    res, half = float(cfg["res"]), float(cfg["half"])
++    centroid, normal, u, w, c_shifted = compute_plane(L, N, R, float(cfg["shift_mm"]))
++    size_2d = int(2 * half / res)
++    origin_2d = (c_shifted - half * u - half * w).tolist()
++    direction_2d = [u[0], w[0], normal[0], u[1], w[1], normal[1], u[2], w[2], normal[2]]
++
++    sampled_seg = reslice(seg_image, size_2d, res, origin_2d, direction_2d, nearest=True, float_output=False)
++    prior_mask, labels = build_annulus_mask(sampled_seg, res)
++    if largest_component(prior_mask) is None:
++        raise ValueError("No aortic root / LV label was found in the new annular plane. "
++                         "Check the hinge points: the plane may miss the aortic root.")
++    final_mask, corr = prior_mask, {}
++    if cfg["correct_seg"]:
++        ct_slice = reslice(ct_image, size_2d, res, origin_2d, direction_2d, nearest=False, float_output=True)
++        corrected, corr = correct_mask_with_intensity(
++            prior_mask, ct_slice, res, float(cfg["correction_margin_mm"]),
++            float(cfg["correction_hu_expansion_k"]), float(cfg["correction_radial_gap_tolerance_mm"]),
++            int(cfg["correction_n_rays"]), float(cfg["correction_ct_smoothing_sigma_mm"]))
++        if largest_component(corrected) is not None:
++            final_mask = corrected
++        else:
++            corr["note"] = "correction produced an empty mask; prior mask used"
++
++    polar = polar_boundary_samples(final_mask, int(cfg["spline_polar_points"]))
++    if polar is None or len(polar) < 4:
++        raise ValueError("Could not trace the annulus boundary in the new plane.")
++    spline_px = fit_closed_spline(polar, int(cfg["spline_eval_points"]))
++    area, perimeter = spline_area_perimeter(spline_px, res)
++    dense_lps = to_lps(spline_px, origin_2d, u, w, res)
++    # Control points evenly spaced along the spline (no duplicated start/end point)
++    idx = np.round(np.linspace(0, len(spline_px), int(cfg["slicer_contour_points"]), endpoint=False)).astype(int)
++    contour_lps = dense_lps[idx]
++    feret = compute_metrics(dense_lps)  # same max/min definition as the Measurements tab
++    return {
++        "contour_lps": contour_lps, "dense_lps": dense_lps,
++        "area_mm2": area, "perimeter_mm": perimeter,
++        "max_d_mm": feret["max_d"], "min_d_mm": feret["min_d"], "mean_d_mm": feret["mean_d"],
++        "eccentricity": feret["ecc"], "max_pts": feret["max_pts"], "min_pts": feret["min_pts"],
++        "labels": labels, "corrected": bool(cfg["correct_seg"]) and final_mask is not prior_mask,
++        "correction": corr, "plane_centroid": centroid, "plane_normal": normal,
++    }
++
++
++def recompute_coronary_height(ostium_lps, L, R, N):
++    """LCH / RCH line: ostium -> its perpendicular foot on the annular plane. Returns (foot, length)."""
++    plane_point, normal = height_plane(L, R, N)
++    return perpendicular_foot(np.asarray(ostium_lps, float), plane_point, normal)
++
++
++def recompute_stj_height(stj_points_lps, L, R, N):
++    """STJ height = smallest distance of the STJ points (dict cusp -> LPS) to the annular plane.
++    Returns (cusp, stj_point, foot, height, {cusp: distance})."""
++    centroid = (L + R + N) / 3.0
++    _p, normal = height_plane(L, R, N)
++    dists = {c: abs(float(np.dot(np.asarray(p, float) - centroid, normal))) for c, p in stj_points_lps.items()}
++    cusp = min(dists, key=dists.get)
++    point = np.asarray(stj_points_lps[cusp], float)
++    foot, _ = perpendicular_foot(point, centroid, normal)
++    return cusp, point, foot, dists[cusp], dists
+diff --git a/TavrWorkbench/TavrWorkbenchLib/cases.py b/TavrWorkbench/TavrWorkbenchLib/cases.py
+index 20a972b..b0a9404 100644
+--- a/TavrWorkbench/TavrWorkbenchLib/cases.py
++++ b/TavrWorkbench/TavrWorkbenchLib/cases.py
+@@ -2,8 +2,10 @@
+ import json
+ import os
+ 
++import glob
++
+ from .constants import (IMAGE_EXTENSIONS, MARKUP_EXTENSIONS, MARKUP_GROUP_KEYS, MEASUREMENT_KEY_TO_LABEL,
+-                        MODEL_EXTENSIONS, PLANES)
++                        MODEL_EXTENSIONS, PLANES, REFERENCE_POINT_GROUPS)
+ 
+ 
+ def is_file(path):
+@@ -32,12 +34,45 @@ def resolve_sample_paths(sample, base_dir):
+     for key in ("image", "label"):
+         if key in out:
+             out[key] = _resolve(out[key], base_dir)
+-    for group in MARKUP_GROUP_KEYS:
++    for group in list(MARKUP_GROUP_KEYS) + list(REFERENCE_POINT_GROUPS) + ["dirs"]:
+         if isinstance(out.get(group), dict):
+             out[group] = {name: _resolve(p, base_dir) for name, p in out[group].items()}
+     return out
+ 
+ 
++def _find_letter_file(folder, letter):
++    """L / R / N point file in a folder (L.mrk.json, l_hinge.mrk.json ...), as in the STJ height script."""
++    if not (isinstance(folder, str) and os.path.isdir(folder)):
++        return None
++    candidates = sorted(glob.glob(os.path.join(folder, "*.mrk.json"))) or \
++        sorted(glob.glob(os.path.join(folder, "*.json")))
++    low = letter.lower()
++    for path in candidates:
++        name = os.path.basename(path).lower().split(".")[0]
++        if name == low or name.startswith(low + "_") or name.startswith(low + "-"):
++            return path
++    for path in candidates:
++        if low in os.path.basename(path).lower().replace("-", "_").replace(".", "_").split("_"):
++            return path
++    return None
++
++
++def reference_points(sample, group):
++    """{letter: path} of the STJ points ("stj_points": L, R, N) or coronary ostia
++    ("coronary_ostia_points": L, R): from the sample's own group, else from its "dirs" folder."""
++    letters = REFERENCE_POINT_GROUPS[group]
++    explicit = sample.get(group) if isinstance(sample.get(group), dict) else {}
++    folder = (sample.get("dirs") or {}).get(group)
++    found = {}
++    for letter in letters:
++        path = explicit.get(letter)
++        if not is_file(path):
++            path = _find_letter_file(folder, letter)
++        if is_file(path):
++            found[letter] = path
++    return found
++
++
+ def read_data_map(path):
+     """Return (usable_samples, n_skipped). A sample is usable when its 'image' exists and is a volume.
+     Paths in the map may be absolute or relative to the map file (portable datasets)."""
+diff --git a/TavrWorkbench/TavrWorkbenchLib/constants.py b/TavrWorkbench/TavrWorkbenchLib/constants.py
+index c9f4cdb..b39d002 100644
+--- a/TavrWorkbench/TavrWorkbenchLib/constants.py
++++ b/TavrWorkbench/TavrWorkbenchLib/constants.py
+@@ -47,7 +47,8 @@ def normalize_review(review):
+ # ---------------------------------------------------------------------------
+ MODE_SEGMENTATION = "segmentation"
+ MODE_MEASUREMENTS = "measurements"
+-MODES = [MODE_SEGMENTATION, MODE_MEASUREMENTS]
++MODE_PLANE = "annular_plane"   # Annular Plane tab: fix hinge points, regenerate annulus + heights
++MODES = [MODE_SEGMENTATION, MODE_MEASUREMENTS, MODE_PLANE]
+ 
+ # Shift+<letter> is identical on Windows, macOS and Linux and doesn't collide with Slicer's
+ # Ctrl+<n> layout shortcuts. Each shortcut acts on the decision of the active mode.
+@@ -134,3 +135,48 @@ SELECTIONS = ["annulus", "sov", "stj", "stj_h", "lch", "rch"]
+ SELECTION_LABELS = {"annulus": "ANNULUS", "sov": "SOV", "stj": "STJ",
+                     "stj_h": "STJ-H", "lch": "LCH", "rch": "RCH"}
+ HEIGHT_SEL = {"stj_h": "stj", "lch": "lch", "rch": "rch"}
++
++# ---------------------------------------------------------------------------
++# Annular Plane tab (hinge-point fix -> regenerated annulus contour, diameters, heights)
++# ---------------------------------------------------------------------------
++# Settings of the annulus measurement pipeline (config_v5.yaml, "global" section)
++ANNULUS_PIPELINE = {
++    "res": 0.5,                    # in-plane pixel spacing (mm)
++    "half": 30.0,                  # half-width of the reslice square (mm)
++    "shift_mm": 0.0,               # shift of the plane along its normal (mm)
++    "spline_polar_points": 26,     # boundary samples fed into the closed spline
++    "spline_eval_points": 1000,    # dense evaluation points on the spline
++    "slicer_contour_points": 26,   # control points of the exported contour
++    "correct_seg": True,           # intensity-guided correction of the prior mask
++    "correction_margin_mm": 3.0,
++    "correction_hu_expansion_k": 2.5,
++    "correction_radial_gap_tolerance_mm": 0.0,
++    "correction_ct_smoothing_sigma_mm": 0.4,
++    "correction_n_rays": 72,
++}
++HINGE_KEYS = ["LCC", "RCC", "NCC"]                      # data-map keys of the hinge points
++HINGE_LETTER = {"LCC": "L", "RCC": "R", "NCC": "N"}     # pipeline names (L / R / N)
++HINGE_COLORS = {"LCC": (1.0, 0.35, 0.35), "RCC": (0.35, 1.0, 0.35), "NCC": (1.0, 1.0, 0.35)}
++# Reference points used to recompute the heights (data-map groups, or the "dirs" folders)
++REFERENCE_POINT_GROUPS = {"stj_points": ("L", "R", "N"), "coronary_ostia_points": ("L", "R")}
++PLANE_DIR = "annular_plane"          # <output>/<case>/annular_plane/  current regenerated files
++ARCHIVE_DIR = "archive"              # <output>/<case>/archive/v1, v2 ... backups made by Apply
++PLANE_FIXES_CSV = "annular_plane_fixes.csv"
++# sample key -> file name inside PLANE_DIR (these replace the data-map files once a case is fixed)
++PLANE_FILES = {
++    ("hinge_points", "LCC"): "hinge_LCC.mrk.json",
++    ("hinge_points", "RCC"): "hinge_RCC.mrk.json",
++    ("hinge_points", "NCC"): "hinge_NCC.mrk.json",
++    ("contours", "annulus"): "annulus_contour.mrk.json",
++    ("max_diameters", "annulus"): "annulus_max_d.mrk.json",
++    ("min_diameters", "annulus"): "annulus_min_d.mrk.json",
++    ("heights", "stj"): "STJ_H.mrk.json",
++    ("heights", "lch"): "LCH.mrk.json",
++    ("heights", "rch"): "RCH.mrk.json",
++}
++PLANE_FIX_COLUMNS = ["case_id", "version", "applied_at",
++                     "lcc_x", "lcc_y", "lcc_z", "rcc_x", "rcc_y", "rcc_z", "ncc_x", "ncc_y", "ncc_z",
++                     "area_mm2", "perimeter_mm", "max_d_mm", "min_d_mm", "mean_d_mm", "eccentricity",
++                     "corrected", "iou_vs_original", "lch_mm", "rch_mm", "stj_height_mm", "stj_cusp",
++                     "archive_dir"]
++
+diff --git a/TavrWorkbench/TavrWorkbenchLib/measurement_editor.py b/TavrWorkbench/TavrWorkbenchLib/measurement_editor.py
+index 3c1e948..96f5e57 100644
+--- a/TavrWorkbench/TavrWorkbenchLib/measurement_editor.py
++++ b/TavrWorkbench/TavrWorkbenchLib/measurement_editor.py
+@@ -10,7 +10,9 @@
+   3D); its values above the annulus plane update live, Reset restores the original, and Save writes the
+   corrected height to the output folder (re-opened from there next time). All contours are locked
+   while a height is selected, and every height is locked while a contour is selected.
+-* Hinge points, centerline points and .vtp models from the data map are loaded view-only.
++* Hinge points, centerline points and .vtp models from the data map are loaded view-only, except in
++  the Annular Plane tab (plane_mode), where only the three hinge points are editable and the annulus
++  contour, its diameters and the heights are shown locked for reference.
+ * While the module is in Segmentation mode every node here is shown (optionally) and locked.
+ """
+ import numpy as np
+@@ -19,7 +21,7 @@ import slicer
+ from vtk.util.numpy_support import vtk_to_numpy
+ 
+ from .cases import collect_case_assets, is_file
+-from .constants import (CONTOUR_FOV, EDITOR_GROUP_KEYS, HEIGHT_COLORS, HEIGHT_FOV, HEIGHT_NAMES, HEIGHT_SEL,
++from .constants import (CONTOUR_FOV, EDITOR_GROUP_KEYS, HINGE_COLORS, HINGE_KEYS, HEIGHT_COLORS, HEIGHT_FOV, HEIGHT_NAMES, HEIGHT_SEL,
+                         HEIGHTS, PLANE_COLORS, PLANES, SELECTIONS)
+ from .geometry import compute_metrics, read_mrk_points, resample_closed, unit
+ 
+@@ -36,10 +38,13 @@ class MeasurementEditor:
+         self._on_update = on_update
+         self.selection = PLANES[0]
+         self.mode_active = False        # True while the module is in Measurements mode
++        self.plane_mode = False         # True while the module is in the Annular Plane tab
++        self.on_hinge_moved = None      # callback for the Annular Plane panel
+         self.show_all_heights = True
+         self.show_in_review = True      # visibility while in Segmentation mode
+         self._tags = []          # observers on the active contour
+         self._height_tags = []   # observers on every height node
++        self._hinge_tags = []    # observers on the hinge points
+         self._guard = False
+         self._reset()
+ 
+@@ -48,6 +53,8 @@ class MeasurementEditor:
+         self.heights = {}        # height key -> main markups node (used for the height values)
+         self.height_parts = {}   # height key -> every node its file added (incl. the main one)
+         self.extras = []         # (group, node): view-only hinge points / centerline markups and models
++        self.hinges = {}         # "LCC"/"RCC"/"NCC" -> hinge point node
++        self.hinge_loaded = {}   # hinge key -> position (RAS) when the case was loaded
+         self.stray = []          # extra nodes found inside contour files (always hidden)
+         self.orig = {}           # plane -> original control points
+         self.orig_metrics = {}   # plane -> metrics of the original contour
+@@ -227,6 +234,13 @@ class MeasurementEditor:
+                 self._slice_intersections(node.GetDisplayNode())
+                 node.SetLocked(True)
+                 self.extras.append((group, node))
++                hinge = key.split(".", 1)[1] if group == "hinge_points" else None
++                if i == 0 and hinge in HINGE_KEYS and node.GetNumberOfControlPoints() > 0:
++                    self._style_hinge(node, hinge)
++                    self.hinges[hinge] = node
++                    self.hinge_loaded[hinge] = self._get_pts(node)[0].copy()
++                    self._hinge_tags.append(
++                        (node, node.AddObserver(slicer.vtkMRMLMarkupsNode.PointModifiedEvent, self._on_hinge_modified)))
+ 
+         for key, path in models.items():
+             try:
+@@ -256,6 +270,7 @@ class MeasurementEditor:
+         """Remove every node of the current case from the scene."""
+         self._detach()
+         self._detach_heights()
++        self._detach_hinges()
+         for node in self.all_nodes():
+             try:
+                 slicer.mrmlScene.RemoveNode(node)
+@@ -267,6 +282,7 @@ class MeasurementEditor:
+         """The scene is being closed: drop node references without touching the scene."""
+         self._detach()
+         self._detach_heights()
++        self._detach_hinges()
+         self._reset()
+ 
+     # ============================================================ styling
+@@ -290,6 +306,21 @@ class MeasurementEditor:
+         d.SetGlyphScale(1.6)
+         d.SetLineThickness(thickness)
+ 
++    @staticmethod
++    def _style_hinge(node, key):
++        d = node.GetDisplayNode()
++        d.SetSelectedColor(*HINGE_COLORS[key])
++        d.SetColor(*HINGE_COLORS[key])
++        d.SetGlyphScale(2.5)
++        d.SetTextScale(3.0)
++        d.SetPointLabelsVisibility(True)
++        d.SetPropertiesLabelVisibility(False)
++        node.SetNthControlPointLabel(0, key)
++        try:  # visible in slice views even when slightly off-plane (Slicer >= 5)
++            d.SetSliceDisplayModeToProjection()
++        except Exception:
++            pass
++
+     @staticmethod
+     def _style_height(node, key):
+         if not node.GetDisplayNode():
+@@ -397,6 +428,50 @@ class MeasurementEditor:
+         self.height_dirty.add(key)
+         self._notify()
+ 
++    def _detach_hinges(self):
++        for node, tag in self._hinge_tags:
++            try:
++                node.RemoveObserver(tag)
++            except Exception:
++                pass
++        self._hinge_tags = []
++
++    def _on_hinge_modified(self, caller, event):
++        if self.on_hinge_moved:
++            try:
++                self.on_hinge_moved()
++            except Exception as e:
++                print(f"[TavrWorkbench] WARNING: annular plane panel update failed: {e}")
++
++    # ============================================================ hinge points (Annular Plane tab)
++    def has_hinges(self):
++        return all(k in self.hinges for k in HINGE_KEYS)
++
++    def hinge_points_lps(self, loaded=False):
++        """{"LCC"/"RCC"/"NCC": LPS position}: current positions, or as loaded with the case."""
++        flip = np.array([-1.0, -1.0, 1.0])
++        if loaded:
++            return {k: p * flip for k, p in self.hinge_loaded.items()}
++        return {k: self._get_pts(n)[0] * flip for k, n in self.hinges.items()}
++
++    def hinge_moves_mm(self):
++        """How far each hinge point has been dragged since the case was loaded (mm)."""
++        return {k: float(np.linalg.norm(self._get_pts(n)[0] - self.hinge_loaded[k]))
++                for k, n in self.hinges.items()}
++
++    def hinges_moved(self, tol_mm=1e-3):
++        return any(d > tol_mm for d in self.hinge_moves_mm().values())
++
++    def reset_hinges(self):
++        for k, node in self.hinges.items():
++            p = self.hinge_loaded[k]
++            node.SetNthControlPointPositionWorld(0, float(p[0]), float(p[1]), float(p[2]))
++        self._on_hinge_modified(None, None)
++
++    def set_plane_mode(self, active):
++        self.plane_mode = bool(active)
++        self.apply_visibility()
++
+     def _activate_plane(self, plane):
+         self._detach()
+         self.active_plane = plane
+@@ -463,6 +538,11 @@ class MeasurementEditor:
+         self._notify()
+ 
+     def apply_visibility(self):
++        if self.plane_mode:
++            self._apply_plane_mode_visibility()
++            return
++        for n in self.hinges.values():
++            n.SetLocked(True)  # hinge points are only editable in the Annular Plane tab
+         if not self.mode_active:
+             # Segmentation review: everything (incl. centerline) for context, all locked
+             for n in self.all_nodes():
+@@ -492,6 +572,25 @@ class MeasurementEditor:
+         for n in self.stray:
+             n.SetDisplayVisibility(False)
+ 
++    def _apply_plane_mode_visibility(self):
++        """Annular Plane tab: hinge points editable; annulus contour, diameters, heights shown locked."""
++        hinge_nodes = set(self.hinges.values())
++        for plane, nodes in self.nodes.items():
++            for n in nodes.values():
++                n.SetDisplayVisibility(plane == "annulus")
++                if _is_markups(n):
++                    n.SetLocked(True)
++        for parts in self.height_parts.values():
++            for n in parts:
++                n.SetDisplayVisibility(True)
++                n.SetLocked(True)
++        for group, n in self.extras:
++            n.SetDisplayVisibility(n in hinge_nodes)
++            if _is_markups(n):
++                n.SetLocked(n not in hinge_nodes)
++        for n in self.stray:
++            n.SetDisplayVisibility(False)
++
+     def _apply_layout(self):
+         # Four-up for contours and heights alike: Red = contour plane, Green/Yellow = long axis, + 3D
+         slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+diff --git a/TavrWorkbench/TavrWorkbenchLib/storage.py b/TavrWorkbench/TavrWorkbenchLib/storage.py
+index 6ad7e38..dea912b 100644
+--- a/TavrWorkbench/TavrWorkbenchLib/storage.py
++++ b/TavrWorkbench/TavrWorkbenchLib/storage.py
+@@ -12,13 +12,20 @@
+         segmentation.seg.nrrd     edited mask (only after "Save mask")
+         <plane>_contour.mrk.json  corrected contour (+ _max_d / _min_d diameter lines)
+         height_<key>.mrk.json     corrected height (stj / lch / rch; extra markups of the same file: _1, _2 ...)
++        annular_plane/            hinge points + annulus contour/diameters + heights regenerated by the
++                                  Annular Plane tab; they replace the data-map files for this case
++        archive/v1, v2 ...        what was in effect before each Annular Plane "Apply" (+ manifest.json)
++    annular_plane_fixes.csv       one row per Apply: hinge points, new annulus metrics and heights
+ """
+ import csv
++import glob
+ import json
+ import os
++import shutil
+ from datetime import datetime
+ 
+-from .constants import (ANNOTATION_COLUMNS, ANNOTATIONS_CSV, CASE_MASK_FILE, CASE_REVIEW_FILE,
++from .constants import (ANNOTATION_COLUMNS, ANNOTATIONS_CSV, ARCHIVE_DIR, PLANE_DIR, PLANE_FILES,
++                        PLANE_FIX_COLUMNS, PLANE_FIXES_CSV, CASE_MASK_FILE, CASE_REVIEW_FILE,
+                         CONTOUR_FILE_SUFFIX, HEIGHT_COLUMNS, HEIGHT_FILE_PREFIX, HEIGHTS_CSV,
+                         MEAS_STATUS_FILE, MEASUREMENT_COLUMNS, MEASUREMENTS_CSV,
+                         MEASUREMENT_KEY_TO_LABEL, RATING_NONE, RATING_TO_STR, SEG_STATUS_FILE,
+@@ -112,6 +119,82 @@ class OutputStore:
+         path = self.height_path(cid, key, part) if self.root else ""
+         return path if path and os.path.isfile(path) else None
+ 
++    # ------------------------------------------------------- annular plane
++    def plane_dir(self, cid):
++        return os.path.join(self.case_dir(cid), PLANE_DIR) if self.root else ""
++
++    def plane_file(self, cid, sample_key):
++        """Regenerated file for ('contours', 'annulus') etc. inside annular_plane/ (may not exist yet)."""
++        return os.path.join(self.plane_dir(cid), PLANE_FILES[sample_key]) if self.root else ""
++
++    def effective_sample(self, sample, cid):
++        """`sample` with the data-map paths replaced by this case's regenerated Annular Plane files
++        (hinge points, annulus contour + diameters, heights), when it has been fixed."""
++        if not self.root or not os.path.isdir(self.plane_dir(cid)):
++            return sample
++        out = dict(sample)
++        for (group, name), _file in PLANE_FILES.items():
++            path = self.plane_file(cid, (group, name))
++            if os.path.isfile(path):
++                out[group] = dict(out.get(group) or {}, **{name: path})
++        return out
++
++    def plane_fix_version(self, cid):
++        return int(self.meas_status.get(str(cid), {}).get("plane_fix_version", 0) or 0)
++
++    def next_archive_dir(self, cid):
++        """archive/v<N+1> (N = highest existing version), not yet created."""
++        base = os.path.join(self.case_dir(cid), ARCHIVE_DIR)
++        versions = [int(os.path.basename(p)[1:]) for p in glob.glob(os.path.join(base, "v*"))
++                    if os.path.basename(p)[1:].isdigit()]
++        version = max(versions + [0]) + 1
++        return version, os.path.join(base, f"v{version}")
++
++    def saved_corrections_superseded_by_plane_fix(self, cid):
++        """Saved Measurements corrections made for the OLD plane: annulus contour/diameters + heights."""
++        paths = [self.contour_path(cid, "annulus", key) for key in ("curve", "max", "min")]
++        paths += glob.glob(os.path.join(self.case_dir(cid), "height_*.mrk.json"))
++        return [p for p in paths if p and os.path.isfile(p)]
++
++    def archive_before_plane_fix(self, cid, sample_in_effect):
++        """Back up everything the fix replaces into archive/v<N>: the files currently in effect
++        ('current/') and the saved corrections for the old plane ('saved_corrections/', moved
++        out so they no longer override the regenerated files). Returns (version, archive_dir, manifest)."""
++        version, adir = self.next_archive_dir(cid)
++        os.makedirs(os.path.join(adir, "current"), exist_ok=True)
++        manifest = {"case_id": str(cid), "version": version, "archived_at": now_iso(),
++                    "current": {}, "saved_corrections": {}}
++        for (group, name), file_name in PLANE_FILES.items():
++            src = (sample_in_effect.get(group) or {}).get(name)
++            if isinstance(src, str) and os.path.isfile(src):
++                shutil.copy2(src, os.path.join(adir, "current", file_name))
++                manifest["current"][file_name] = src
++        corrections = self.saved_corrections_superseded_by_plane_fix(cid)
++        if corrections:
++            os.makedirs(os.path.join(adir, "saved_corrections"), exist_ok=True)
++            for src in corrections:
++                dst = os.path.join(adir, "saved_corrections", os.path.basename(src))
++                shutil.move(src, dst)
++                manifest["saved_corrections"][os.path.basename(src)] = src
++        _write_json(os.path.join(adir, "manifest.json"), manifest)
++        return version, adir, manifest
++
++    def record_plane_fix(self, cid, version, archive_dir, manifest, row):
++        """After the new files are written: complete the manifest, upsert annular_plane_fixes.csv and
++        update correction_status.json (annulus / heights edits now belong to the archived version)."""
++        manifest["applied"] = row
++        _write_json(os.path.join(archive_dir, "manifest.json"), manifest)
++        path = self.path(PLANE_FIXES_CSV)
++        rows = _read_csv(path, lambda r: (r.get("case_id", ""), str(r.get("version", ""))))
++        rows[(str(cid), str(version))] = dict(row, case_id=str(cid), version=version, archive_dir=archive_dir)
++        _write_csv(path, PLANE_FIX_COLUMNS, rows.values())
++        entry = self.meas_status.setdefault(str(cid), {})
++        entry["plane_fix_version"] = version
++        entry["plane_fixed_at"] = row.get("applied_at", now_iso())
++        entry["planes_edited"] = [p for p in entry.get("planes_edited", []) if p != "annulus"]
++        entry["heights_edited"] = []
++        self.dump()
++
+     def edited_mask_path(self, cid):
+         p = self.case_path(cid, CASE_MASK_FILE)
+         return p if p and os.path.isfile(p) else ""
+diff --git a/TavrWorkbench/tools/package_dataset.py b/TavrWorkbench/tools/package_dataset.py
+index 705aad2..0e62aca 100755
+--- a/TavrWorkbench/tools/package_dataset.py
++++ b/TavrWorkbench/tools/package_dataset.py
+@@ -1,7 +1,8 @@
+ #!/usr/bin/env python3
+ """Build a portable TavrWorkbench dataset folder from a data map with absolute paths.
+ 
+-Every file a case references is copied into  <out>/cases/<case_id>/...  (the image and label are named
++Every file a case references is copied into  <out>/cases/<case_id>/...  (including the STJ points and
++coronary ostium points the Annular Plane tab uses to regenerate the heights)  (the image and label are named
+ after the case: <case_id>.nii.gz and <case_id>.seg.nrrd) and a new data_map.json with
+ paths RELATIVE to itself is written next to it. The folder can then be shared (OneDrive, Google Drive,
+ USB disk, zip) and opened from any location on macOS or Windows: in TavrWorkbench just select
+@@ -18,6 +19,7 @@ and files left in a case folder by an earlier run (e.g. under an old name) are r
+ Only the Python standard library is used.
+ """
+ import argparse
++import glob
+ import json
+ import os
+ import shutil
+@@ -26,6 +28,9 @@ import zipfile
+ 
+ FILE_KEYS = ("image", "label")
+ GROUP_KEYS = ("hinge_points", "contours", "max_diameters", "min_diameters", "heights", "centerline")
++# Points the Annular Plane tab needs to regenerate the heights; taken from the sample's own group or,
++# for older data maps, from the folder in sample["dirs"] (files L.mrk.json, R.mrk.json, N.mrk.json ...)
++REFERENCE_GROUPS = {"stj_points": ("L", "R", "N"), "coronary_ostia_points": ("L", "R")}
+ # Longest first, so ".seg.nrrd" wins over ".nrrd"
+ SUFFIXES = (".seg.nrrd", ".nii.gz", ".mrk.json", ".nrrd", ".nii", ".vtp", ".vtk", ".json")
+ ALREADY_COMPRESSED = (".gz", ".nrrd", ".zip")
+@@ -36,6 +41,35 @@ def suffix_of(path):
+     return next((s for s in SUFFIXES if name.endswith(s)), os.path.splitext(name)[1])
+ 
+ 
++def find_letter_file(folder, letter):
++    """L / R / N point file in a folder (L.mrk.json, l_hinge.mrk.json ...), as in the STJ height script."""
++    if not (isinstance(folder, str) and os.path.isdir(folder)):
++        return None
++    candidates = sorted(glob.glob(os.path.join(folder, "*.mrk.json"))) or \
++        sorted(glob.glob(os.path.join(folder, "*.json")))
++    low = letter.lower()
++    for path in candidates:
++        name = os.path.basename(path).lower().split(".")[0]
++        if name == low or name.startswith(low + "_") or name.startswith(low + "-"):
++            return path
++    for path in candidates:
++        if low in os.path.basename(path).lower().replace("-", "_").replace(".", "_").split("_"):
++            return path
++    return None
++
++
++def reference_entries(sample, group):
++    """{letter: path} for a reference group, or {} when the case has none."""
++    explicit = sample.get(group) if isinstance(sample.get(group), dict) else {}
++    folder = (sample.get("dirs") or {}).get(group)
++    found = {}
++    for letter in REFERENCE_GROUPS[group]:
++        path = explicit.get(letter) or find_letter_file(folder, letter)
++        if path:
++            found[letter] = path
++    return found
++
++
+ def parse_case_filter(text):
+     if not text:
+         return None
+@@ -79,7 +113,7 @@ def copy_file(src, dst):
+ def referenced_paths(entry):
+     """Every relative file path a new data-map entry points to."""
+     paths = [entry[k] for k in FILE_KEYS if k in entry]
+-    for group in GROUP_KEYS:
++    for group in list(GROUP_KEYS) + list(REFERENCE_GROUPS):
+         paths += list((entry.get(group) or {}).values())
+     return paths
+ 
+@@ -144,6 +178,14 @@ def package(map_path, out_dir, cases=None):
+                     copied[name] = rel
+             if copied:
+                 new[group] = copied
++        for group in REFERENCE_GROUPS:
++            copied = {}
++            for letter, src in reference_entries(sample, group).items():
++                rel = take(src, f"{group}/{letter}")
++                if rel:
++                    copied[letter] = rel
++            if copied:
++                new[group] = copied
+         stale = remove_stale_files(out_dir, case_rel, new)
+         new_samples.append(new)
+         print(f"  [{len(new_samples):3d}] case {cid}" + (f"  (removed {stale} old file(s))" if stale else ""))

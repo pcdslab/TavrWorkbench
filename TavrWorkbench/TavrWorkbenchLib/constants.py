@@ -47,7 +47,8 @@ def normalize_review(review):
 # ---------------------------------------------------------------------------
 MODE_SEGMENTATION = "segmentation"
 MODE_MEASUREMENTS = "measurements"
-MODES = [MODE_SEGMENTATION, MODE_MEASUREMENTS]
+MODE_PLANE = "annular_plane"   # Annular Plane tab: fix hinge points, regenerate annulus + heights
+MODES = [MODE_SEGMENTATION, MODE_MEASUREMENTS, MODE_PLANE]
 
 # Shift+<letter> is identical on Windows, macOS and Linux and doesn't collide with Slicer's
 # Ctrl+<n> layout shortcuts. Each shortcut acts on the decision of the active mode.
@@ -134,3 +135,48 @@ SELECTIONS = ["annulus", "sov", "stj", "stj_h", "lch", "rch"]
 SELECTION_LABELS = {"annulus": "ANNULUS", "sov": "SOV", "stj": "STJ",
                     "stj_h": "STJ-H", "lch": "LCH", "rch": "RCH"}
 HEIGHT_SEL = {"stj_h": "stj", "lch": "lch", "rch": "rch"}
+
+# ---------------------------------------------------------------------------
+# Annular Plane tab (hinge-point fix -> regenerated annulus contour, diameters, heights)
+# ---------------------------------------------------------------------------
+# Settings of the annulus measurement pipeline (config_v5.yaml, "global" section)
+ANNULUS_PIPELINE = {
+    "res": 0.5,                    # in-plane pixel spacing (mm)
+    "half": 30.0,                  # half-width of the reslice square (mm)
+    "shift_mm": 0.0,               # shift of the plane along its normal (mm)
+    "spline_polar_points": 26,     # boundary samples fed into the closed spline
+    "spline_eval_points": 1000,    # dense evaluation points on the spline
+    "slicer_contour_points": 26,   # control points of the exported contour
+    "correct_seg": True,           # intensity-guided correction of the prior mask
+    "correction_margin_mm": 3.0,
+    "correction_hu_expansion_k": 2.5,
+    "correction_radial_gap_tolerance_mm": 0.0,
+    "correction_ct_smoothing_sigma_mm": 0.4,
+    "correction_n_rays": 72,
+}
+HINGE_KEYS = ["LCC", "RCC", "NCC"]                      # data-map keys of the hinge points
+HINGE_LETTER = {"LCC": "L", "RCC": "R", "NCC": "N"}     # pipeline names (L / R / N)
+HINGE_COLORS = {"LCC": (1.0, 0.35, 0.35), "RCC": (0.35, 1.0, 0.35), "NCC": (1.0, 1.0, 0.35)}
+# Reference points used to recompute the heights (data-map groups, or the "dirs" folders)
+REFERENCE_POINT_GROUPS = {"stj_points": ("L", "R", "N"), "coronary_ostia_points": ("L", "R")}
+PLANE_DIR = "annular_plane"          # <output>/<case>/annular_plane/  current regenerated files
+ARCHIVE_DIR = "archive"              # <output>/<case>/archive/v1, v2 ... backups made by Apply
+PLANE_FIXES_CSV = "annular_plane_fixes.csv"
+# sample key -> file name inside PLANE_DIR (these replace the data-map files once a case is fixed)
+PLANE_FILES = {
+    ("hinge_points", "LCC"): "hinge_LCC.mrk.json",
+    ("hinge_points", "RCC"): "hinge_RCC.mrk.json",
+    ("hinge_points", "NCC"): "hinge_NCC.mrk.json",
+    ("contours", "annulus"): "annulus_contour.mrk.json",
+    ("max_diameters", "annulus"): "annulus_max_d.mrk.json",
+    ("min_diameters", "annulus"): "annulus_min_d.mrk.json",
+    ("heights", "stj"): "STJ_H.mrk.json",
+    ("heights", "lch"): "LCH.mrk.json",
+    ("heights", "rch"): "RCH.mrk.json",
+}
+PLANE_FIX_COLUMNS = ["case_id", "version", "applied_at",
+                     "lcc_x", "lcc_y", "lcc_z", "rcc_x", "rcc_y", "rcc_z", "ncc_x", "ncc_y", "ncc_z",
+                     "area_mm2", "perimeter_mm", "max_d_mm", "min_d_mm", "mean_d_mm", "eccentricity",
+                     "corrected", "iou_vs_original", "lch_mm", "rch_mm", "stj_height_mm", "stj_cusp",
+                     "archive_dir"]
+
