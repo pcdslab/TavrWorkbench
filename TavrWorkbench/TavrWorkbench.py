@@ -9,6 +9,8 @@ One case list, two review modes:
                   correct STJ / coronary heights on long-axis planes, Approve / Flag (overall + per item).
 * Annular Plane - correct the LCC / RCC / NCC hinge points; Apply backs up the current files and
                   regenerates the annulus contour, its diameters and the STJ / coronary heights.
+* Valve         - build a parametric TAVR valve from the measurements, place it on the annulus,
+                  export <case>_valve.stl (CT patient coordinates).
 
 Both modes share case navigation, the comment, Save / Save & Next and the output folder.
 Implementation lives in TavrWorkbenchLib/ (see its __init__.py for the module map).
@@ -28,7 +30,7 @@ from slicer.util import VTKObservationMixin
 from TavrWorkbenchLib.cases import (case_id_of, has_contours, has_measurements, is_file, is_image_path,
                                     measurement_rating_keys, read_data_map)
 from TavrWorkbenchLib.constants import (CASE_MASK_FILE, LOG_FILE, MASK_STATUS_TEXT, MEAS_SEGMENTATION_OPACITY_3D,
-                                        MEASUREMENT_KEY_TO_LABEL, MODE_MEASUREMENTS, MODE_PLANE, MODE_SEGMENTATION,
+                                        MEASUREMENT_KEY_TO_LABEL, MODE_MEASUREMENTS, MODE_PLANE, MODE_SEGMENTATION, MODE_VALVE,
                                         MODES,
                                         NOT_APPLICABLE_MARK, PENDING_MARK, RATING_ACCEPT, RATING_FLAG,
                                         RATING_TO_MARK, SEGMENTATION_LABELS, SELECTION_LABELS, SELECTIONS,
@@ -39,12 +41,13 @@ from TavrWorkbenchLib.rating_table import (RatingTable, group_rating, make_decis
                                            uncheck_group)
 from TavrWorkbenchLib.segmentation_editor import SegmentationController
 from TavrWorkbenchLib.storage import OutputStore
+from TavrWorkbenchLib.valve_panel import ValvePanel
 
 # Suppress VTK warnings globally to prevent console flooding and UI freezing
 vtk.vtkObject.GlobalWarningDisplayOff()
 
 MODE_TITLES = {MODE_SEGMENTATION: "segmentation", MODE_MEASUREMENTS: "measurements",
-               MODE_PLANE: "annular plane"}
+               MODE_PLANE: "annular plane", MODE_VALVE: "valve"}
 PLANE_FIXED_MARK = " ⟳"   # case list: the annular plane of this case has been fixed
 
 
@@ -150,6 +153,8 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.meas.on_hinge_moved = self.plane.refresh
         main_layout = uiWidget.layout()
         main_layout.insertWidget(main_layout.indexOf(self.ui.measPanel) + 1, self.plane.widget)
+        self.valve = ValvePanel(self)
+        main_layout.insertWidget(main_layout.indexOf(self.plane.widget) + 1, self.valve.widget)
 
         self._setupCaseSection()
         self._setupModeSwitch()
@@ -192,6 +197,11 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                                         "diameters and heights (previous files are backed up)")
         self.ui.modeWidget.layout().addWidget(self.planeModeButton)
         self.modeGroup.addButton(self.planeModeButton, 2)
+        self.valveModeButton = qt.QPushButton("Valve")
+        self.valveModeButton.setCheckable(True)
+        self.valveModeButton.setToolTip("Build a TAVR valve from this case's measurements, place it, export STL")
+        self.ui.modeWidget.layout().addWidget(self.valveModeButton)
+        self.modeGroup.addButton(self.valveModeButton, 3)
         self.modeGroup.connect("buttonClicked(int)", lambda i: self._setMode(MODES[i]))
 
     def _setupSegmentationPanel(self):
@@ -267,9 +277,9 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         return 0 <= idx < len(self.case_flags) and self.case_flags[idx][0]
 
     def _reviewMode(self, mode=None):
-        """Mode whose Approve / Flag progress applies: the Annular Plane tab follows Measurements."""
+        """Mode whose Approve / Flag progress applies: Annular Plane and Valve follow Measurements."""
         mode = mode or self.mode
-        return MODE_MEASUREMENTS if mode == MODE_PLANE else mode
+        return MODE_MEASUREMENTS if mode in (MODE_PLANE, MODE_VALVE) else mode
 
     def _isReviewed(self, idx, mode):
         cid = self.caseId(idx)
@@ -340,9 +350,11 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.segModeButton.setChecked(is_seg)
         self.ui.measModeButton.setChecked(mode == MODE_MEASUREMENTS)
         self.planeModeButton.setChecked(mode == MODE_PLANE)
+        self.valveModeButton.setChecked(mode == MODE_VALVE)
         self.ui.segPanel.setVisible(is_seg)
         self.ui.measPanel.setVisible(mode == MODE_MEASUREMENTS)
         self.plane.widget.setVisible(mode == MODE_PLANE)
+        self.valve.widget.setVisible(mode == MODE_VALVE)
         if not is_seg:
             self.seg.deactivate_effect()  # no accidental painting while dragging contour points
         self._applyModeToScene()
@@ -351,6 +363,7 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         measuring = self.mode == MODE_MEASUREMENTS and self.meas.has_contours()
         planing = self.mode == MODE_PLANE and self._case_loaded
         self._applySegmentationDisplay()
+        self.meas.set_valve_mode(self.mode == MODE_VALVE)
         self.meas.set_plane_mode(self.mode == MODE_PLANE)
         self.meas.set_mode_active(self.mode == MODE_MEASUREMENTS)
         if planing:
@@ -360,6 +373,11 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.plane.refresh()
         if self.mode != MODE_PLANE:
             self.plane.leave()  # restore the crosshair / slice-intersection settings
+        if self.mode == MODE_VALVE and self._case_loaded:
+            self.valve.enter()
+            self._views_reformatted = True
+        else:
+            self.valve.leave()  # valve models are only shown in the Valve tab
         if measuring:
             self._views_reformatted = True
         elif self._views_reformatted:
@@ -373,8 +391,8 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if is_seg:
             self.seg.set_display(outline_only=False, visible=True, opacity_3d=None)
             self.seg.set_opacity_3d(1.0)
-        elif self.mode == MODE_PLANE:
-            show = self.plane.show_segmentation()
+        elif self.mode in (MODE_PLANE, MODE_VALVE):
+            show = (self.plane if self.mode == MODE_PLANE else self.valve).show_segmentation()
             self.seg.set_display(outline_only=True, visible=show,
                                  opacity_3d=MEAS_SEGMENTATION_OPACITY_3D if show else None)
         else:
@@ -395,7 +413,7 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._views_reformatted = False
 
     def _onDecisionShortcut(self, rating):
-        if not self.parent.isEntered or not self._case_loaded or self.mode == MODE_PLANE:
+        if not self.parent.isEntered or not self._case_loaded or self.mode in (MODE_PLANE, MODE_VALVE):
             return
         _group, approve, flag = self._decisionWidgets()
         if approve.enabled:
@@ -523,6 +541,7 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._case_loaded = True
         self._restoreReview(idx)
         self._updateMeasurementPanel()
+        self.valve.on_case_loaded()
         self._applyModeToScene()
         self.ui.saveLabel.setText("")
         self.refreshCombo()
@@ -533,6 +552,7 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     # ==================================================================
     def _clearCaseNodes(self):
         """Remove every MRML node belonging to the currently loaded case."""
+        self.valve.clear()
         self.seg.store_visibility()
         nodes = set(self.seg.release())
         if self.volume_node is not None:
@@ -566,6 +586,7 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                        lambda plane: self.store.find_saved_contour(cid, plane),
                        lambda key, part: self.store.find_saved_height(cid, key, part))
         self._updateMeasurementPanel()
+        self.valve.on_case_loaded()
         self._applyModeToScene()
 
     def _loadCaseData(self):
@@ -749,7 +770,7 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         return True
 
     def saveAndNext(self):
-        if self.mode == MODE_PLANE:   # Apply already saved the fix; the review decision is in Measurements
+        if self.mode in (MODE_PLANE, MODE_VALVE):   # nothing to decide here; the decision is in Measurements
             self.step(1)
             return
         nothing_to_review = self.mode == MODE_MEASUREMENTS and not self._caseHasMeasurements(self.current_index)
@@ -811,6 +832,8 @@ class TavrWorkbenchWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._case_loaded = False
         self._refreshMeasurementLabels()
         self.plane.refresh()
+        self.valve.forget()
+        self.valve.refresh()
 
     def onSceneEndClose(self, caller, event):
         if self.parent.isEntered:

@@ -39,6 +39,7 @@ class MeasurementEditor:
         self.selection = PLANES[0]
         self.mode_active = False        # True while the module is in Measurements mode
         self.plane_mode = False         # True while the module is in the Annular Plane tab
+        self.valve_mode = False         # True while the module is in the Valve tab (everything locked)
         self.on_hinge_moved = None      # callback for the Annular Plane panel
         self.show_all_heights = True
         self.show_in_review = True      # visibility while in Segmentation mode
@@ -472,6 +473,20 @@ class MeasurementEditor:
         self.plane_mode = bool(active)
         self.apply_visibility()
 
+    def set_valve_mode(self, active):
+        self.valve_mode = bool(active)
+        self.apply_visibility()
+
+    def plane_measurements(self, plane):
+        """Area, perimeter, max / min / mean and perimeter-derived diameter of a contour (current points)."""
+        nodes = self.nodes.get(plane)
+        m = compute_metrics(self._dense_pts(nodes["curve"])) if nodes else None
+        if m is None:
+            return None
+        return {"area_mm2": m["area"], "perimeter_mm": m["perimeter"], "max_d_mm": m["max_d"],
+                "min_d_mm": m["min_d"], "mean_d_mm": m["mean_d"], "perimeter_d_mm": m["perimeter"] / np.pi,
+                "max_pts": m["max_pts"]}
+
     def _activate_plane(self, plane):
         self._detach()
         self.active_plane = plane
@@ -538,6 +553,9 @@ class MeasurementEditor:
         self._notify()
 
     def apply_visibility(self):
+        if self.valve_mode:
+            self._apply_valve_mode_visibility()
+            return
         if self.plane_mode:
             self._apply_plane_mode_visibility()
             return
@@ -569,6 +587,23 @@ class MeasurementEditor:
         # hinge points are shown for context in the heights view.
         for group, n in self.extras:
             n.SetDisplayVisibility(heights_view and group != "centerline")
+        for n in self.stray:
+            n.SetDisplayVisibility(False)
+
+    def _apply_valve_mode_visibility(self):
+        """Valve tab: annulus / SOV / STJ contours and the heights shown for reference, all locked."""
+        for nodes in self.nodes.values():
+            for key, n in nodes.items():
+                n.SetDisplayVisibility(key == "curve")
+                n.SetLocked(True)
+        for parts in self.height_parts.values():
+            for n in parts:
+                n.SetDisplayVisibility(True)
+                n.SetLocked(True)
+        for _group, n in self.extras:
+            n.SetDisplayVisibility(False)
+            if _is_markups(n):
+                n.SetLocked(True)
         for n in self.stray:
             n.SetDisplayVisibility(False)
 

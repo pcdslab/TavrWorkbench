@@ -48,7 +48,8 @@ def normalize_review(review):
 MODE_SEGMENTATION = "segmentation"
 MODE_MEASUREMENTS = "measurements"
 MODE_PLANE = "annular_plane"   # Annular Plane tab: fix hinge points, regenerate annulus + heights
-MODES = [MODE_SEGMENTATION, MODE_MEASUREMENTS, MODE_PLANE]
+MODE_VALVE = "valve"           # Valve tab: build a TAVR valve from the measurements, place it, export STL
+MODES = [MODE_SEGMENTATION, MODE_MEASUREMENTS, MODE_PLANE, MODE_VALVE]
 
 # Shift+<letter> is identical on Windows, macOS and Linux and doesn't collide with Slicer's
 # Ctrl+<n> layout shortcuts. Each shortcut acts on the decision of the active mode.
@@ -179,4 +180,13 @@ PLANE_FIX_COLUMNS = ["case_id", "version", "applied_at",
                      "area_mm2", "perimeter_mm", "max_d_mm", "min_d_mm", "mean_d_mm", "eccentricity",
                      "corrected", "iou_vs_original", "lch_mm", "rch_mm", "stj_height_mm", "stj_cusp",
                      "archive_dir"]
+
+# ---------------------------------------------------------------------------
+# Valve tab
+# ---------------------------------------------------------------------------
+VALVE_STL = "{cid}_valve.stl"        # <output>/<case>/<case>_valve.stl  (CT patient / LPS coordinates, mm)
+VALVE_JSON = "{cid}_valve.json"      # parameters, measurements and valve -> LPS transform used for the STL
+# Generator inputs taken from the case's measurements (the rest are valve design settings)
+VALVE_ANATOMY_KEYS = ["annulus_min", "annulus_max", "coronary_h", "coronary_h2", "stj_h", "stj_d", "asc_aorta_d"]
+VALVE_COLORS = {"frame": (0.75, 0.75, 0.8), "skirt": (0.95, 0.95, 0.9), "leaflets": (0.9, 0.75, 0.55)}
 
